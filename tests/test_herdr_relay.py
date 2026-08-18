@@ -1903,6 +1903,34 @@ class RelayCsiKeyTests(unittest.TestCase):
 
 
 class RelayCommandTests(unittest.TestCase):
+    def test_send_text_accepts_long_content_without_logging_it(self):
+        with loaded_relay() as relay:
+            pane_id = "pane-1"
+            text = "private prompt " + "x" * 2000
+            relay.known_panes.add(pane_id)
+            ws = _FakeWebSocket([json.dumps({
+                "type": "send_text",
+                "pane_id": pane_id,
+                "text": text,
+            })])
+
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay, "run_herdr") as run, \
+                 mock.patch.object(relay.log, "info") as log_info, \
+                 mock.patch.object(relay, "audit") as audit:
+                asyncio.run(relay.handle_client(ws))
+
+            run.assert_called_once_with("pane", "send-text", pane_id, text, remote=None)
+            self.assertNotIn(text, repr(log_info.call_args_list))
+            self.assertNotIn(text, repr(audit.call_args_list))
+            log_info.assert_any_call(
+                "Text from %s (%s): pane=%s chars=%d",
+                "127.0.0.1", "script", pane_id, len(text),
+            )
+            audit.assert_called_with(
+                "send_text", "127.0.0.1", "script", pane_id, f"chars={len(text)}",
+            )
+
     def test_command_connection_skips_snapshot_and_correlates_ack(self):
         with loaded_relay() as relay:
             pane_id = "pane-1"

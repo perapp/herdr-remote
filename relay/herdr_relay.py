@@ -3330,12 +3330,12 @@ async def handle_client(ws):
                     await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
                     continue
                 text = msg.get("text", "")
-                if not text or len(text) > 1000:
-                    await ws.send(json.dumps({"type": "error", "message": "text empty or too long"}))
+                if not isinstance(text, str) or not text:
+                    await ws.send(json.dumps({"type": "error", "message": "text must be a non-empty string"}))
                     continue
                 remote = pane_remote_map.get(pane_id)
-                log.info("Text from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
-                audit("send_text", ip, device, pane_id, f"text={text!r}")
+                log.info("Text from %s (%s): pane=%s chars=%d", ip, device, pane_id, len(text))
+                audit("send_text", ip, device, pane_id, f"chars={len(text)}")
                 await asyncio.to_thread(run_herdr, "pane", "send-text", pane_id, text, remote=remote)
             elif msg_type == "agent_prompt":
                 # Use 'herdr agent prompt' for proper submission (works with Codex, Claude, etc.)

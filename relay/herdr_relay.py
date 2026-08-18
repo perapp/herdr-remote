@@ -4046,12 +4046,12 @@ async def handle_client(ws):
                     await ws.send(text_error("unknown pane_id"))
                     continue
                 text = msg.get("text", "")
-                if not text or len(text) > 1000:
-                    await ws.send(text_error("text empty or too long"))
+                if not isinstance(text, str) or not text:
+                    await ws.send(text_error("text must be a non-empty string"))
                     continue
                 remote = pane_remote_map.get(pane_id)
-                log.info("Text from %s (%s): pane=%s text=%r", ip, device, pane_id, text)
-                audit("send_text", ip, device, pane_id, f"text={text!r}")
+                log.info("Text from %s (%s): pane=%s chars=%d", ip, device, pane_id, len(text))
+                audit("send_text", ip, device, pane_id, f"chars={len(text)}")
                 # The exit status used to be dropped here, so a send that never reached the pane
                 # looked delivered from both ends: the log said "Text from", the client had
                 # already cleared its box, and nothing arrived.

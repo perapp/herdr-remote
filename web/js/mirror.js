@@ -16,7 +16,7 @@
 // the FIRST LINE. Collie polls the same mirror every few seconds with no selection code at all,
 // because React renders one keyed node per line: a change on line 7 never touches line 3's node.
 //
-// So the mirror is a line per span from here on, and an update is a reconcile:
+// So the mirror is a line per styled run from here on, and an update is a reconcile:
 //   - identical content              -> no DOM at all (most ticks: an idle pane repeats itself)
 //   - the buffer scrolled by k lines -> the lines that stayed keep their NODES (mirrorShift)
 //   - a line that only grew          -> appendData, the one range-safe mutation
@@ -25,12 +25,82 @@
 // The newline between two lines is a text node BETWEEN the spans rather than inside one, so
 // `el.textContent` is byte-identical to the old flat render -- doSearch counts offsets in it.
 
+function terminalUrlParts(text) {
+  const parts = [];
+  const urlPattern = /https?:\/\/[^\s<>"'`]+/gi;
+  let cursor = 0;
+
+  for (const match of text.matchAll(urlPattern)) {
+    let url = match[0];
+    const closingDelimiters = {')': '(', ']': '[', '}': '{'};
+    while (url) {
+      const last = url.at(-1);
+      if (/[.,;:!?]/.test(last)) {
+        url = url.slice(0, -1);
+        continue;
+      }
+      const open = closingDelimiters[last];
+      if (open && url.split(last).length > url.split(open).length) {
+        url = url.slice(0, -1);
+        continue;
+      }
+      break;
+    }
+
+    if (match.index > cursor) parts.push({text: text.slice(cursor, match.index)});
+    parts.push({text: url, href: url});
+    if (url.length < match[0].length) parts.push({text: match[0].slice(url.length)});
+    cursor = match.index + match[0].length;
+  }
+
+  if (cursor < text.length) parts.push({text: text.slice(cursor)});
+  return parts;
+}
+
+// Decorate the visible output after ANSI parsing, so a URL split across colour/style sequences is
+// still one link. Cloned spans retain every style, while text and href are assigned as properties:
+// terminal output can never become markup.
+function terminalFragment(input) {
+  const source = ansiFragment(input);
+  const parts = terminalUrlParts(source.textContent);
+  if (!parts.some(part => part.href)) return source;
+
+  const out = document.createDocumentFragment();
+  const runs = [...source.childNodes];
+  let runIndex = 0, runOffset = 0;
+  for (const part of parts) {
+    const target = part.href ? document.createElement('a') : out;
+    if (part.href) {
+      target.href = part.href;
+      target.target = '_blank';
+      target.rel = 'noopener noreferrer';
+    }
+    let remaining = part.text.length;
+    while (remaining > 0) {
+      const run = runs[runIndex];
+      const available = run.textContent.length - runOffset;
+      const take = Math.min(remaining, available);
+      const copy = run.cloneNode(false);
+      copy.textContent = run.textContent.slice(runOffset, runOffset + take);
+      target.appendChild(copy);
+      remaining -= take;
+      runOffset += take;
+      if (runOffset === run.textContent.length) {
+        runIndex += 1;
+        runOffset = 0;
+      }
+    }
+    if (part.href) out.appendChild(target);
+  }
+  return out;
+}
+
 function mirrorLineNodes(content) {
   const lines = [];
   let line = document.createElement('span');
   line.className = 'term-line';
   // Snapshotted, because appendChild MOVES a node out of the live NodeList being walked.
-  for (const run of [...ansiFragment(content).childNodes]) {
+  for (const run of [...terminalFragment(content).childNodes]) {
     const text = run.textContent;
     // A run that does not straddle a newline -- almost all of them -- is adopted whole rather than
     // cloned. Measured on a 1000-line coloured buffer, that is the difference between building 5000
@@ -56,13 +126,16 @@ function mirrorLineNodes(content) {
 // Same run, meaning the same box with the same styling -- its TEXT is compared separately, because
 // text is the part that can sometimes be healed instead of replaced.
 function mirrorSameRun(a, b) {
-  return a.nodeName === b.nodeName
-    && (a.nodeType !== 1 || a.getAttribute('style') === b.getAttribute('style'));
+  if (a.nodeName !== b.nodeName
+      || (a.nodeType === 1 && a.getAttribute('style') !== b.getAttribute('style'))) return false;
+  if (a.nodeName !== 'A') return true;
+  const have = [...a.childNodes], want = [...b.childNodes];
+  return have.length === want.length && have.every((child, i) => mirrorSameRun(child, want[i]));
 }
 
 function mirrorTextNode(node) {
   if (node.nodeType === 3) return node;
-  return node.childNodes.length === 1 && node.firstChild.nodeType === 3 ? node.firstChild : null;
+  return node.childNodes.length === 1 ? mirrorTextNode(node.firstChild) : null;
 }
 
 // One line against what it should say. Returns whether the DOM moved.
@@ -77,6 +150,9 @@ function mirrorPatchLine(line, want) {
     const text = mirrorTextNode(a);
     if (!text || !now.startsWith(was)) break;
     text.appendData(now.slice(was.length));
+    // Link text and its destination grow together as terminal output arrives. Keeping the anchor
+    // lets a selection inside it survive; leaving the old href would open a truncated URL.
+    if (a.nodeName === 'A') a.href = b.getAttribute('href');
     changed = true;
   }
   if (i < have.length) { line.replaceChildren(...next); return true; }

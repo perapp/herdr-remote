@@ -48,6 +48,15 @@ cd herdr-remote/relay && ./start.sh
 
 Open [herdr-demo.pages.dev](https://herdr-demo.pages.dev) on your phone, paste the tunnel URL.
 
+For direct access over a trusted LAN:
+
+```bash
+./run.sh
+```
+
+This binds the relay to port 8001, stores a persistent access token in
+`~/.config/herdr-remote/run-token`, and prints the access URL plus a QR code for your phone.
+
 ### Windows
 
 With Git, [uv](https://docs.astral.sh/uv/), and `herdr` installed:

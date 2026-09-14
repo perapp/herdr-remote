@@ -39,6 +39,10 @@ echo "3. start.sh executable"
 [ -x "$DIR/relay/start.sh" ]
 assert_eq "$?" "0" "start.sh +x"
 
+echo "3b. LAN runner executable and valid"
+[ -x "$DIR/run.sh" ] && bash -n "$DIR/run.sh"
+assert_eq "$?" "0" "run.sh +x and parses"
+
 # --- Telegram ---
 echo ""
 echo "=== Telegram bot ==="

@@ -54,8 +54,8 @@ For direct access over a trusted LAN:
 ./run.sh
 ```
 
-This binds the relay to port 8001, stores a persistent access token in
-`~/.config/herdr-remote/run-token`, and prints the access URL plus a QR code for your phone.
+This binds the relay to port 8001, enables non-agent shell panes, stores a persistent access token
+in `~/.config/herdr-remote/run-token`, and prints the access URL plus a QR code for your phone.
 
 ### Windows
 

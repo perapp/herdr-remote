@@ -91,7 +91,7 @@ CONTRAST = """(sel => {
 @unittest.skipIf(sync_playwright is None, "playwright is not installed")
 @unittest.skipIf(_chrome() is None, "no chromium build available")
 class WebThemeTests(unittest.TestCase):
-    """The palette and the three-way pin."""
+    """The palette, three-way theme pin, and terminal display preferences."""
 
     @classmethod
     def setUpClass(cls):
@@ -107,7 +107,12 @@ class WebThemeTests(unittest.TestCase):
         # Back to Auto on a dark OS. Every test owns its own starting point, and the pin is
         # localStorage -- it would otherwise outlive the test that set it.
         self.page.emulate_media(color_scheme="dark")
-        self.page.evaluate("() => setTheme('auto')")
+        self.page.evaluate("""() => {
+          setTheme('auto');
+          localStorage.removeItem(TERMINAL_FONT_KEY);
+          localStorage.removeItem(TERMINAL_WRAP_KEY);
+          applyTerminalDisplay();
+        }""")
 
     def body(self):
         return self.page.evaluate("""() => {
@@ -264,6 +269,53 @@ class WebThemeTests(unittest.TestCase):
         self.assertTrue(stacks["term"].startswith('"Hack Nerd Font"'), stacks["term"])
         # And the terminal falls back to the same stack the UI runs on, so one edit moves both.
         self.assertIn("ui-monospace", stacks["term"])
+
+    # --- terminal display ---
+
+    def test_terminal_wrap_is_on_by_default_and_controls_match(self):
+        got = self.page.evaluate("""() => {
+          const term = getComputedStyle(document.getElementById('termContent'));
+          const slider = document.getElementById('terminalFontSize');
+          return {size: term.fontSize, whiteSpace: term.whiteSpace,
+                  overflowWrap: term.overflowWrap, slider: slider.value,
+                  min: slider.min, max: slider.max,
+                  output: document.getElementById('terminalFontSizeValue').textContent,
+                  wrap: document.getElementById('terminalWrap').checked};
+        }""")
+        self.assertEqual(got, {"size": "13px", "whiteSpace": "pre-wrap",
+                               "overflowWrap": "anywhere", "slider": "13",
+                               "min": "9", "max": "20", "output": "13 px", "wrap": True})
+
+    def test_wrapping_removes_sideways_scroll_for_an_unbroken_line(self):
+        got = self.page.evaluate("""() => {
+          const el = document.createElement('div');
+          el.className = 'term-content';
+          el.style.cssText = 'position:fixed;width:160px;height:100px';
+          el.textContent = 'X'.repeat(200);
+          document.body.appendChild(el);
+          setTerminalWrap(true);
+          const wrapped = {client: el.clientWidth, scroll: el.scrollWidth};
+          setTerminalWrap(false);
+          const unwrapped = {client: el.clientWidth, scroll: el.scrollWidth};
+          el.remove();
+          setTerminalWrap(true);
+          return {wrapped, unwrapped};
+        }""")
+        self.assertLessEqual(got["wrapped"]["scroll"], got["wrapped"]["client"] + 1)
+        self.assertGreater(got["unwrapped"]["scroll"], got["unwrapped"]["client"])
+
+    def test_terminal_preferences_apply_and_survive_reload(self):
+        self.page.evaluate("() => { setTerminalFontSize(17); setTerminalWrap(false); }")
+        self.page.reload()
+        got = self.page.evaluate("""() => {
+          const term = getComputedStyle(document.getElementById('termContent'));
+          return {size: term.fontSize, whiteSpace: term.whiteSpace,
+                  slider: document.getElementById('terminalFontSize').value,
+                  output: document.getElementById('terminalFontSizeValue').textContent,
+                  wrap: document.getElementById('terminalWrap').checked};
+        }""")
+        self.assertEqual(got, {"size": "17px", "whiteSpace": "pre", "slider": "17",
+                               "output": "17 px", "wrap": False})
 
 
 if __name__ == "__main__":  # pragma: no cover

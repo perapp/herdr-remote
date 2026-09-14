@@ -103,6 +103,60 @@ matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => {
 });
 applyTheme();
 
+// Terminal display preferences are local to this browser: phone and desktop can use different
+// sizes without changing what the relay sends. Wrapping is on by default so a phone never needs a
+// sideways drag just to read a command or URL; it can still be disabled for fixed-width layouts.
+const TERMINAL_FONT_KEY = 'herdr_terminal_font_size';
+const TERMINAL_WRAP_KEY = 'herdr_terminal_wrap';
+const TERMINAL_FONT_DEFAULT = 13;
+const TERMINAL_FONT_MIN = 9;
+const TERMINAL_FONT_MAX = 20;
+
+function normalizedTerminalFontSize(value) {
+  if (value === null || value === '') return TERMINAL_FONT_DEFAULT;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return TERMINAL_FONT_DEFAULT;
+  return Math.min(TERMINAL_FONT_MAX, Math.max(TERMINAL_FONT_MIN, Math.round(parsed)));
+}
+
+function terminalFontSize() {
+  try { return normalizedTerminalFontSize(localStorage.getItem(TERMINAL_FONT_KEY)); }
+  catch (e) { return TERMINAL_FONT_DEFAULT; }
+}
+
+function terminalWrapEnabled() {
+  try { return localStorage.getItem(TERMINAL_WRAP_KEY) !== '0'; }
+  catch (e) { return true; }
+}
+
+function applyTerminalDisplay(size = terminalFontSize(), wrap = terminalWrapEnabled()) {
+  size = normalizedTerminalFontSize(size);
+  document.documentElement.style.setProperty('--term-font-size', `${size}px`);
+  document.documentElement.dataset.terminalWrap = wrap ? 'on' : 'off';
+  const slider = document.getElementById('terminalFontSize');
+  const value = document.getElementById('terminalFontSizeValue');
+  const checkbox = document.getElementById('terminalWrap');
+  if (slider) slider.value = String(size);
+  if (value) value.textContent = `${size} px`;
+  if (checkbox) checkbox.checked = wrap;
+}
+
+function setTerminalFontSize(value) {
+  const size = normalizedTerminalFontSize(value);
+  try { localStorage.setItem(TERMINAL_FONT_KEY, String(size)); }
+  catch (e) {}
+  applyTerminalDisplay(size, terminalWrapEnabled());
+}
+
+function setTerminalWrap(enabled) {
+  const wrap = Boolean(enabled);
+  try { localStorage.setItem(TERMINAL_WRAP_KEY, wrap ? '1' : '0'); }
+  catch (e) {}
+  applyTerminalDisplay(terminalFontSize(), wrap);
+}
+
+applyTerminalDisplay();
+
 
 
 // Back-button navigation — every view or overlay that covers the agent list

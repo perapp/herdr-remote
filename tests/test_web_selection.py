@@ -582,6 +582,59 @@ class WebMirrorPatchTests(unittest.TestCase, _Selecting):
           {type: 'pane_content', pane_id: 'wB:pH', content: body})""", self.BODY)
         self.assertEqual(self.page.eval_on_selector("#termContent", "e => e.scrollTop"), 20)
 
+    def test_http_urls_become_safe_links_without_changing_terminal_text(self):
+        content = (
+            "Open http://localhost:8081, then "
+            "https://en.wikipedia.org/wiki/Herdr_(software). <script> javascript:alert(1)"
+        )
+        self.patch(content)
+        got = self.page.eval_on_selector("#termContent", """el => ({
+          text: el.textContent,
+          links: [...el.querySelectorAll('a')].map(a => ({
+            text: a.textContent, href: a.getAttribute('href'), target: a.target, rel: a.rel
+          }))
+        })""")
+        self.assertEqual(got["text"], content)
+        self.assertEqual(got["links"], [
+            {"text": "http://localhost:8081", "href": "http://localhost:8081",
+             "target": "_blank", "rel": "noopener noreferrer"},
+            {"text": "https://en.wikipedia.org/wiki/Herdr_(software)",
+             "href": "https://en.wikipedia.org/wiki/Herdr_(software)",
+             "target": "_blank", "rel": "noopener noreferrer"},
+        ])
+
+    def test_a_link_keeps_ansi_style_and_updates_its_href_as_output_grows(self):
+        base = "\x1b[1;31mOpen https://example.test/path"
+        self.patch(base)
+        self.page.eval_on_selector("#termContent > *", "e => e.__linkLine = true")
+        self.select("#termContent", "https://example.test")
+
+        self.patch(base + "/more")
+        got = self.page.eval_on_selector("#termContent", """el => {
+          const link = el.querySelector('a'), run = link.firstElementChild;
+          return {href: link.getAttribute('href'), weight: run.style.fontWeight,
+                  color: run.style.color, lineKept: el.firstElementChild.__linkLine === true};
+        }""")
+        self.assertEqual(got["href"], "https://example.test/path/more")
+        self.assertEqual(got["weight"], "700")
+        self.assertTrue(got["color"])
+        self.assertTrue(got["lineKept"])
+        self.assertEqual(self.selected(), "https://example.test")
+
+    def test_one_link_can_span_multiple_ansi_styles(self):
+        content = "\x1b[31mhttps://example\x1b[32m.test/path"
+        self.patch(content)
+        got = self.page.eval_on_selector("#termContent a", """link => ({
+          text: link.textContent,
+          href: link.getAttribute('href'),
+          runs: [...link.children].map(run => ({text: run.textContent, color: run.style.color}))
+        })""")
+        self.assertEqual(got["text"], "https://example.test/path")
+        self.assertEqual(got["href"], "https://example.test/path")
+        self.assertEqual([run["text"] for run in got["runs"]],
+                         ["https://example", ".test/path"])
+        self.assertNotEqual(got["runs"][0]["color"], got["runs"][1]["color"])
+
 
 @unittest.skipIf(sync_playwright is None, "playwright is not installed")
 @unittest.skipIf(_chrome() is None, "no chromium build available")

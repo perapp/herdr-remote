@@ -393,6 +393,8 @@ body { font-family: var(--font-mono); background: var(--bg); color: var(--text);
 .session-name { font-weight: 500; flex: 1; }
 .session-url { font-size: 0.7rem; color: var(--muted); font-family: var(--font-mono); }
 .term-content { flex: 1; min-width: 0; overflow: auto; padding: 10px 12px; background: var(--term-bg); color-scheme: dark; font-family: var(--font-term); font-size: clamp(0.68rem, 2.7vw, 0.8rem); line-height: 1.35; white-space: pre; color: var(--term-text); -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+.term-content a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.term-content a:hover { color: var(--blue) !important; }
 .quick-actions { padding: 6px 10px; border-top: 1px solid var(--border); display: flex; gap: 5px; flex-wrap: wrap; flex-shrink: 0; }
 .quick-actions button { padding: 8px 12px; border-radius: 8px; border: none; font-size: 0.8rem; font-weight: 600; cursor: pointer; flex: 1; min-width: 70px; display: flex; align-items: center; justify-content: center; gap: 6px; }
 /* A full option label ("Yes, and don't ask again for ...") cannot share a row with three more of

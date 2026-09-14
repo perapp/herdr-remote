@@ -50,6 +50,15 @@ Open [herdr-demo.pages.dev](https://herdr-demo.pages.dev) on your phone, paste t
 
 For a fixed address on your own domain, with a login page in front of the relay, see [REMOTE_ACCESS.md](REMOTE_ACCESS.md).
 
+For direct access over a trusted LAN:
+
+```bash
+./run.sh
+```
+
+This binds the relay to port 8001, stores a persistent access token in
+`~/.config/herdr-remote/run-token`, and prints the access URL plus a QR code for your phone.
+
 ### Windows
 
 With Git, [uv](https://docs.astral.sh/uv/), and `herdr` installed:

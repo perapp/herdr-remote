@@ -26,11 +26,63 @@ const MD_HREF_OK = /^(https?:|mailto:)/i;
 const MD_INLINE = /(`+)([\s\S]*?)\1|\*\*(\S[\s\S]*?\S|\S)\*\*|\*(\S[\s\S]*?\S|\S)\*|\[([^\]\n]+)\]\(([^)\s]+)\)/g;
 const MD_MAX_DEPTH = 6;
 
+// Bare URLs are common in agent replies. Show a short destination, never a screenful of query
+// tokens, while retaining the exact URL for opening/copying. Code and explicit link labels stay
+// verbatim. This is presentation only: no fetch, preview, or token-bearing request is made.
+function mdText(parent, text) {
+  if (parent.closest?.('a')) { parent.appendChild(document.createTextNode(text)); return; }
+  for (const part of terminalUrlParts(text)) {
+    if (!part.href) { parent.appendChild(document.createTextNode(part.text)); continue; }
+    let url;
+    try { url = new URL(part.href); }
+    catch (e) { parent.appendChild(document.createTextNode(part.text)); continue; }
+    const wrap = document.createElement('span');
+    wrap.className = 'conversation-link';
+    const link = document.createElement('a');
+    link.href = part.href;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    const label = url.host + (url.pathname === '/' ? '' : url.pathname);
+    link.textContent = label.length > 48 ? label.slice(0, 45) + '…' : label;
+    link.setAttribute('aria-label', `Open ${url.host}`);
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.textContent = 'Copy';
+    copy.setAttribute('aria-label', `Copy link to ${url.host}`);
+    copy.addEventListener('click', () => copyConversationLink(part.href, copy));
+    wrap.append(link, copy);
+    parent.appendChild(wrap);
+  }
+}
+
+async function copyConversationLink(href, button) {
+  let copied = false;
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(href);
+      copied = true;
+    }
+  } catch (e) { /* The permission can be refused; try the user-initiated LAN fallback. */ }
+  if (!copied) {
+    const input = document.createElement('textarea');
+    input.value = href;
+    input.setAttribute('readonly', '');
+    input.style.cssText = 'position:fixed;left:-9999px;top:0';
+    document.body.appendChild(input);
+    input.select();
+    try { copied = document.execCommand('copy'); } catch (e) { /* Report the refusal below. */ }
+    input.remove();
+    button.focus({preventScroll: true});
+  }
+  button.textContent = copied ? 'Copied' : 'Copy failed';
+  button.setAttribute('aria-label', copied ? 'Link copied' : 'Copy failed; use the link menu to copy');
+}
+
 function mdInline(parent, text, depth = 0) {
   if (depth >= MD_MAX_DEPTH) { parent.appendChild(document.createTextNode(text)); return; }
   let cursor = 0;
   for (const m of String(text).matchAll(MD_INLINE)) {
-    if (m.index > cursor) parent.appendChild(document.createTextNode(text.slice(cursor, m.index)));
+    if (m.index > cursor) mdText(parent, text.slice(cursor, m.index));
     cursor = m.index + m[0].length;
     if (m[2] !== undefined) {
       // Verbatim by definition: never re-parsed, and the surrounding spaces GFM allows are trimmed.
@@ -58,7 +110,7 @@ function mdInline(parent, text, depth = 0) {
       }
     }
   }
-  if (cursor < text.length) parent.appendChild(document.createTextNode(text.slice(cursor)));
+  if (cursor < text.length) mdText(parent, text.slice(cursor));
 }
 
 const MD_FENCE = /^\s*(```+|~~~+)\s*([\w.+#-]*)\s*$/;

@@ -196,14 +196,12 @@ class WebKeyPadTests(unittest.TestCase):
         self.assertEqual(rows, 1)
         self.assertLess(height, PHONE["height"] * 0.10)
 
-    def test_the_input_row_stays_short(self):
-        """It was 60px for one line of text and four icons, and stayed 60px after the stylesheet
-        rule was cut -- the two tallest children carried their padding INLINE, where no rule can
-        reach it, and the row is a flex box so every child stretches to the tallest. 43px now.
-        """
+    def test_the_input_row_fits_a_single_line_and_touch_targets(self):
+        """44px targets plus 8px padding, rather than a short row with tiny buttons."""
         height = self.page.evaluate(
             "() => document.querySelector('.term-input').getBoundingClientRect().height")
-        self.assertLess(height, 47, f"the input row is back up to {height}px")
+        self.assertGreaterEqual(height, 44)
+        self.assertLessEqual(height, 62)
 
     def test_no_button_in_the_input_row_sets_its_own_padding(self):
         """The trap above, closed: an inline padding outranks every stylesheet rule, so shrinking
@@ -430,7 +428,8 @@ class WebToggleStateTests(unittest.TestCase):
           document.getElementById('terminalView').classList.add('active');
           activePane = 'w0:p1';
           ws = {readyState: 1, send: () => {}};
-          hideSearch(); hideHistory(); showDock(null);
+          setSessionView('terminal'); hideSearch(); showDock(null);
+          finishHistoryRequest(); resetConversation();
         }""")
 
     def look(self, button_id):
@@ -457,7 +456,7 @@ class WebToggleStateTests(unittest.TestCase):
         self.assert_lights("searchBtn", "() => toggleSearch()", "() => toggleSearch()")
 
     def test_the_history_button_lights_while_the_panel_is_open(self):
-        self.assert_lights("historyBtn", "() => toggleHistory()", "() => toggleHistory()")
+        self.assert_lights("conversationModeBtn", "() => toggleHistory()", "() => toggleHistory()")
 
     def test_the_keys_dock_button_lights_while_the_dock_is_up(self):
         self.assert_lights("keysDockBtn", "() => toggleKeysDock()", "() => toggleKeysDock()")
@@ -472,20 +471,21 @@ class WebToggleStateTests(unittest.TestCase):
         self.assertEqual(self.look("keysDockBtn")["pressed"], "false")
         self.assertEqual(self.look("quickDockBtn")["pressed"], "true")
 
-    def test_search_and_history_unlight_each_other(self):
-        """They share the space under the header, so opening one closes -- and dims -- the other."""
-        self.page.evaluate("() => toggleHistory()")
-        self.page.evaluate("() => toggleSearch()")
-        self.assertEqual(self.look("historyBtn")["pressed"], "false")
+    def test_search_routes_to_the_active_view(self):
+        self.page.evaluate("() => setSessionView('conversation')")
+        self.page.evaluate("() => toggleSessionSearch()")
+        self.assertEqual(self.look("conversationModeBtn")["pressed"], "true")
         self.assertEqual(self.look("searchBtn")["pressed"], "true")
-        self.page.evaluate("() => toggleHistory()")
-        self.assertEqual(self.look("searchBtn")["pressed"], "false")
-        self.assertEqual(self.look("historyBtn")["pressed"], "true")
+        self.assertNotEqual(self.page.eval_on_selector("#historyFind", "e => e.style.display"), "none")
+        self.page.evaluate("() => setSessionView('terminal')")
+        self.page.evaluate("() => toggleSessionSearch()")
+        self.assertEqual(self.look("conversationModeBtn")["pressed"], "false")
+        self.assertEqual(self.look("searchBtn")["pressed"], "true")
+        self.assertNotEqual(self.page.eval_on_selector("#termSearch", "e => e.style.display"), "none")
 
-    def test_search_closing_history_also_drops_its_history_entry(self):
-        """It used to hide the panel directly, leaving a nav layer with nothing behind it."""
-        self.page.evaluate("() => toggleHistory()")
-        self.page.evaluate("() => toggleSearch()")
+    def test_switching_views_does_not_add_a_history_overlay_navigation_entry(self):
+        self.page.evaluate("() => setSessionView('conversation')")
+        self.page.evaluate("() => setSessionView('terminal')")
         self.assertNotIn("history", self.page.evaluate("() => navStack.map(l => l.key)"))
 
     def test_the_pad_switch_shows_which_pad_is_up(self):
@@ -532,10 +532,11 @@ class WebToggleStateTests(unittest.TestCase):
     def test_the_history_request_carries_the_tool_flag_it_shows(self):
         sent = self.page.evaluate("""() => {
           const out = [];
+          finishHistoryRequest();
           history_.loading = false;
           const real = ws;
           ws = {readyState: 1, send: p => out.push(JSON.parse(p))};
-          loadHistory();
+          setSessionView('conversation');
           ws = real;
           return out;
         }""")

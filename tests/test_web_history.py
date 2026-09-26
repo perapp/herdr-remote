@@ -268,12 +268,20 @@ class WebRendererTests(unittest.TestCase):
         self.assertIn("agent", agent["head"])
         self.assertIn("strong", agent["tags"])
 
-    def test_a_plain_tool_call_is_one_row_and_does_not_open(self):
+    def test_a_plain_tool_call_has_one_summary_and_expandable_raw_details(self):
         node = self.turn({"uuid": "t1", "role": "tool", "text": "Bash(ls -la) → ok",
                           "tool": "Bash", "target": "ls -la"})
-        self.assertEqual(node["tag"], "div")
-        self.assertNotIn("details", node["tags"])
+        self.assertEqual(node["tag"], "details")
+        self.assertIn("summary", node["tags"])
+        self.assertIn("tool-details", node["classes"])
         self.assertIn("ls -la", node["text"])
+        self.assertIn("Bash(ls -la) → ok", node["text"])
+        malicious = self.turn({"uuid": "t-raw", "role": "tool", "tool": "Bash",
+                               "target": "<script>bad()</script>", "error": True,
+                               "result": "<img src=x onerror=bad()>"})
+        self.assertNotIn("script", malicious["tags"])
+        self.assertNotIn("img", malicious["tags"])
+        self.assertIn("<img src=x onerror=bad()>", malicious["text"])
 
     def test_a_file_edit_opens_into_its_diff_with_the_whole_count(self):
         node = self.turn({"uuid": "t2", "role": "tool", "text": "Edit(/repo/x.py)",
@@ -357,10 +365,11 @@ class WebHistoryPanelTests(unittest.TestCase):
           activePane = 'w1:p1';
           ws = {readyState: 1, send: () => {}};
           document.getElementById('terminalView').classList.add('active');
-          if (document.getElementById('termHistory').style.display !== 'none') hideHistory();
-          closeHistoryFind();
-          toggleHistory();
-          receiveHistory({messages: p.turns, total: p.turns.length, title: p.title});
+          finishHistoryRequest();
+          resetConversation();
+          setSessionView('conversation');
+          receiveHistory({pane_id: activePane, request_id: historyPending.id,
+                          messages: p.turns, total: p.turns.length, title: p.title});
         }""", {"turns": list(turns), "title": title})
 
     def stamp(self, ts):
@@ -415,24 +424,24 @@ class WebHistoryPanelTests(unittest.TestCase):
 
     # ------------------------------------------------------------------ header
 
-    def test_the_header_is_one_row(self):
-        """It was two -- a title bar over a filter bar -- measured 80px of a 390x844 screen, 9.5%,
-        spent before a single turn had rendered. One row is 35px."""
+    def test_the_filter_header_costs_nothing_until_opened(self):
+        """The session header already names the conversation; find only costs a row when used."""
         self.open_panel()
         rows = self.header_rows()
-        self.assertEqual(len(rows), 1, f"the panel header grew back to {len(rows)} rows")
-        self.assertLess(rows[0], 40, f"the header row is {rows[0]}px")
+        self.assertEqual(rows, [0])
+        self.page.evaluate("toggleSessionSearch()")
+        self.assertGreaterEqual(self.header_rows()[0], 44)
+        self.assertLess(self.header_rows()[0], 70)
 
-    def test_the_filter_costs_no_height_and_the_title_yields_its_slot(self):
-        """The input opens IN PLACE of the title, which is the whole reason the row stays one row."""
+    def test_the_filter_is_one_row_and_the_title_yields_its_slot(self):
+        """Find opens one optional row with accessible controls, never a second title row."""
         self.open_panel()
-        before = self.header_rows()[0]
         shut = self.page.evaluate("""() => [
           document.getElementById('historyFind').offsetWidth,
           document.getElementById('historyTitle').offsetWidth]""")
         self.assertEqual(shut[0], 0, "the filter box is on screen before anyone asked for it")
-        self.assertGreater(shut[1], 0)
-        self.page.eval_on_selector("#historyFindBtn", "e => e.click()")
+        self.assertEqual(shut[1], 0)
+        self.page.evaluate("toggleSessionSearch()")
         opened = self.page.evaluate("""() => [
           document.getElementById('historyFind').offsetWidth,
           document.getElementById('historyTitle').offsetWidth,
@@ -440,7 +449,8 @@ class WebHistoryPanelTests(unittest.TestCase):
           document.getElementById('historyFindBtn').getAttribute('aria-pressed')]""")
         self.assertGreater(opened[0], 0)
         self.assertEqual(opened[1], 0, "the title and the filter are both taking up the row")
-        self.assertEqual(opened[2], before, "opening the filter made the header taller")
+        self.assertGreaterEqual(opened[2], 44)
+        self.assertLess(opened[2], 70)
         self.assertEqual(opened[3], "true")
 
     def test_closing_the_filter_drops_the_needle(self):
@@ -466,7 +476,7 @@ class WebHistoryPanelTests(unittest.TestCase):
         self.page.evaluate("loadHistory()")
         self.assertEqual(self.page.eval_on_selector("#historyFindBtn",
                                                     "e => e.getAttribute('aria-pressed')"), "false")
-        self.assertGreater(self.page.eval_on_selector("#historyTitle", "e => e.offsetWidth"), 0)
+        self.assertEqual(self.header_rows(), [0])
 
     def test_a_pull_at_the_top_of_the_list_stops_at_the_panel(self):
         """Chained to the document it became Chrome's pull-to-refresh, which reloads the whole app

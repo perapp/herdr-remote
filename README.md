@@ -56,6 +56,8 @@ For direct access over a trusted LAN:
 
 This binds the relay to port 8001, enables non-agent shell panes, stores a persistent access token
 in `~/.config/herdr-remote/run-token`, and prints the access URL plus a QR code for your phone.
+It prefers a private address on a physical LAN interface over VPN/tunnel addresses. Set
+`HERDR_LAN_IP` to override the advertised address when more than one LAN interface is active.
 
 ### Reading on a phone
 

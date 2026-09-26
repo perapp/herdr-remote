@@ -39,7 +39,104 @@ if [[ ! "$HERDR_RELAY_TOKEN" =~ ^[A-Za-z0-9_-]{16,128}$ ]]; then
 fi
 
 LAN_IP="$(python3 - <<'PY'
+import ipaddress
+import json
+import os
+import re
+import shutil
 import socket
+import subprocess
+import sys
+
+
+def parse_ipv4(value):
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if address.version != 4 or address.is_loopback or address.is_unspecified:
+        return None
+    return address
+
+
+def is_rfc1918(address):
+    return any(address in network for network in (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+    ))
+
+
+def interface_score(interface, address):
+    virtual_prefixes = (
+        "awdl", "br-", "docker", "gif", "llw", "lo", "podman", "stf",
+        "tailscale", "tap", "tun", "utun", "veth", "virbr", "wg",
+    )
+    physical_prefixes = ("en", "eth", "wlan", "wlp")
+    score = 100 if is_rfc1918(address) else 0
+    if interface.startswith(physical_prefixes):
+        score += 50
+    if interface.startswith(virtual_prefixes):
+        score -= 200
+    return score
+
+
+def add_candidate(candidates, interface, value):
+    address = parse_ipv4(value)
+    if address is None or address.is_link_local:
+        return
+    candidate = (interface_score(interface, address), interface, str(address))
+    if candidate not in candidates:
+        candidates.append(candidate)
+
+
+override = os.environ.get("HERDR_LAN_IP")
+if override:
+    address = parse_ipv4(override)
+    if address is None:
+        print("Error: HERDR_LAN_IP must be a usable IPv4 address.", file=sys.stderr)
+        raise SystemExit(1)
+    print(address)
+    raise SystemExit
+
+candidates = []
+if shutil.which("ip"):
+    try:
+        output = subprocess.run(
+            ["ip", "-j", "-4", "addr", "show", "up"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=2,
+        ).stdout
+        for interface in json.loads(output):
+            name = interface.get("ifname", "")
+            for info in interface.get("addr_info", []):
+                add_candidate(candidates, name, info.get("local", ""))
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        pass
+
+if shutil.which("ifconfig"):
+    try:
+        output = subprocess.run(
+            ["ifconfig"], capture_output=True, text=True, timeout=2
+        ).stdout
+        interface = ""
+        for line in output.splitlines():
+            match = re.match(r"^([A-Za-z0-9_.:-]+):", line)
+            if match:
+                interface = match.group(1)
+                continue
+            match = re.match(r"^\s*inet\s+(?:addr:)?([0-9.]+)", line)
+            if interface and match:
+                add_candidate(candidates, interface, match.group(1))
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+if candidates:
+    # Prefer RFC 1918 addresses on physical interfaces over VPN/tunnel addresses.
+    print(max(candidates, key=lambda candidate: candidate[0])[2])
+    raise SystemExit
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 try:

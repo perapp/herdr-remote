@@ -927,38 +927,26 @@ class WebSessionNavTests(unittest.TestCase):
                   screen: window.innerHeight};
         }""")
 
-    def test_the_session_view_starts_exactly_where_the_app_header_ends(self):
-        """The header is `--header-h` tall and the fixed session view starts at `--header-h`, which
-        is one number written once. It used to be two: a hardcoded top of 49px against a header that
-        measured 69px, so the view covered the bottom 20px of the header and clipped both of its
-        buttons through the whole of a session."""
+    def test_the_phone_session_replaces_the_global_header(self):
         self.page.evaluate("openTerminal('wA:pH')")
         c = self.chrome()
-        self.assertEqual(c["viewTop"], c["header"],
-                         f"the session view starts at {c['viewTop']}px under a {c['header']}px header")
+        self.assertEqual(c["viewTop"], 0)
+        self.assertEqual(c["header"], 0)
 
-    def test_the_chrome_above_the_output_is_a_measured_eighth_of_the_phone(self):
-        """The output is the point of this screen, and everything above it is rent. Measured at
-        390x844 with both levels showing: 69px of app header (of which 20 were behind the session
-        view), 55px of session header and 66px of two sibling rows -- 170px, 20.1%, before a single
-        line of a pane had rendered. It is 44 + 39 + 33 = 116px now, 13.7%, and the ceiling is set
-        just above that."""
-        self.page.evaluate("openTerminal('wA:pH')")
+    def test_the_session_chrome_keeps_a_small_share_of_the_phone(self):
+        self.page.evaluate("openTerminal('wA:pH'); setSessionView('terminal')")
         c = self.chrome()
-        self.assertLess(c["contentTop"] / c["screen"], 0.15,
+        self.assertLess(c["contentTop"] / c["screen"], 0.16,
                         f"the chrome grew to {c['contentTop']}px of {c['screen']}px: {c}")
-        self.assertLess(c["header"], 50)
-        self.assertLess(c["termHeader"], 45)
+        self.assertEqual(c["header"], 0)
+        self.assertLessEqual(c["termHeader"], 50)
 
-    def test_the_session_header_is_one_row_of_children_pinned_to_one_height(self):
-        """A flex row is as tall as its tallest child. This one was 55px because `back` carried a
-        1.4rem font-size around a 20px icon -- text metrics for a button with no text in it -- so
-        every child is pinned instead, the same rule the history bar runs on."""
+    def test_the_session_header_uses_one_row_of_touch_sized_children(self):
         self.page.evaluate("openTerminal('wA:pH')")
         heights = self.page.evaluate("""() => [...document.querySelectorAll('.term-header > *')]
           .filter(e => e.offsetParent).map(e => e.offsetHeight)""")
         self.assertGreater(len(heights), 3, "the header lost its controls")
-        self.assertEqual(set(heights), {28}, f"the header's children measure {heights}")
+        self.assertEqual(set(heights), {44}, f"the header's children measure {heights}")
 
     def test_one_row_holds_both_levels_and_one_scroller_holds_the_row(self):
         """They were two rows of 33px, and 4 of the 10 agent panes on the measured host paid for
@@ -1117,17 +1105,16 @@ class WebSessionNavTests(unittest.TestCase):
                                ".overscrollBehaviorX"),
             "contain")
 
-    def test_the_history_panel_still_covers_everything_under_the_header(self):
-        """Both rows are in normal flow, so a panel opened over the output covers them too -- the
-        same geometry the panel already had, which is why positionHistoryPanel is untouched."""
-        self.page.evaluate("openTerminal('wA:pH'); toggleHistory()")
-        for sel in ("#termSiblings", "#termSibs"):
-            covered = self.page.evaluate("""sel => {
-              const s = document.querySelector(sel).getBoundingClientRect();
+    def test_conversation_keeps_sibling_navigation_and_composer_reachable(self):
+        self.page.evaluate("openTerminal('wA:pH'); setSessionView('conversation')")
+        for sel in ("#termSiblings", "#termInput"):
+            reachable = self.page.evaluate("""sel => {
+              const target = document.querySelector(sel);
+              const s = target.getBoundingClientRect();
               const el = document.elementFromPoint(s.left + s.width / 2, s.top + s.height / 2);
-              return document.getElementById('termHistory').contains(el);
+              return el === target || target.contains(el);
             }""", sel)
-            self.assertTrue(covered, f"{sel} was reachable through the history panel")
+            self.assertTrue(reachable, f"{sel} was covered by the conversation")
 
 
 @unittest.skipIf(sync_playwright is None, "playwright is not installed")

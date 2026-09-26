@@ -235,6 +235,9 @@ function mirrorPatch(el, content) {
 // even sent while a selection is held: it would cost the relay a herdr call -- an SSH round trip
 // for a remote host -- to fetch content this tick has already decided it may not render.
 function mirrorTick() {
+  if (!sessionVisible()) return;
+  updateSessionStatus();
+  if (sessionView === 'conversation') { conversationTick(); return; }
   // History does not change under you. Once the reader has paged back, the live screen is no
   // longer what is on display, so there is nothing for a tick to keep up to date.
   if (!paneFollowing) return;
@@ -245,7 +248,9 @@ function mirrorTick() {
 function closeTerminal() { navClose('terminal', hideTerminal); }
 
 function hideTerminal() {
+  resetSessionControls(null);
   activePane = null; clearInterval(refreshInterval);
+  invalidateHistory();
   document.getElementById('terminalView').classList.remove('active');
   document.getElementById('agentListView').style.display = '';
 }
@@ -348,11 +353,6 @@ function toggleSearch() {
   if (bar.style.display === 'none') {
     bar.style.display = 'flex';
     setPressed('searchBtn', true);
-    // Through navClose, not by hiding the panel: history pushed a history entry, and dropping the
-    // element without dropping the entry left the next Back press with nothing to close.
-    if (document.getElementById('termHistory').style.display !== 'none') {
-      navClose('history', hideHistory);
-    }
     input.focus();
   } else {
     hideSearch();
@@ -366,28 +366,94 @@ function hideSearch() {
   clearSearch();
 }
 
-// The panel is absolutely positioned inside the terminal view and has to start below its header,
-// which is 45px tall on a phone and taller on a desktop where the layout has more room.
-function positionHistoryPanel() {
-  const panel = document.getElementById('termHistory');
-  const header = document.querySelector('.term-header');
-  if (panel.style.display !== 'none' && header) panel.style.top = header.offsetHeight + 'px';
+// Conversation and Terminal are primary views, not navigation overlays.
+let sessionView = 'terminal';
+const sessionViewChoices = new Map();
+const sessionDrafts = new Map();
+
+function sessionVisible() {
+  return !!activePane && document.visibilityState !== 'hidden'
+    && document.getElementById('terminalView').classList.contains('active');
 }
 
-function toggleHistory() {
-  const panel = document.getElementById('termHistory');
-  if (panel.style.display !== 'none') { navClose('history', hideHistory); return; }
-  panel.style.display = 'flex';
-  setPressed('historyBtn', true);
-  positionHistoryPanel();
-  hideSearch(); // the two share the space under the header
-  navPush('history', hideHistory);
-  loadHistory();
+function resetSessionControls(nextPane) {
+  const input = document.getElementById('termInput');
+  if (activePane) {
+    if (input.value) sessionDrafts.set(activePane, input.value);
+    else sessionDrafts.delete(activePane);
+  }
+  input.value = sessionDrafts.get(nextPane) || '';
+  if (typeof hideComposerTools === 'function') hideComposerTools();
+  if (typeof closeSessionActions === 'function') closeSessionActions();
+  if (typeof showDock === 'function') showDock(null);
+  if (typeof clearKeyQueue === 'function') clearKeyQueue();
+  if (typeof resizeComposer === 'function') resizeComposer();
+}
+function defaultSessionView(pane) {
+  return matchMedia('(max-width: 600px)').matches && pane &&
+    ['pi', 'claude'].includes(pane.agent) ? 'conversation' : 'terminal';
 }
 
-function hideHistory() {
-  document.getElementById('termHistory').style.display = 'none';
-  setPressed('historyBtn', false);
+function setSessionView(view, remember = true) {
+  if (!activePane || !['conversation', 'terminal'].includes(view)) return;
+  if (remember) sessionViewChoices.set(activePane, view);
+  const changed = sessionView !== view;
+  sessionView = view;
+  document.getElementById('terminalView').dataset.sessionView = view;
+  document.getElementById('termHistory').style.display = view === 'conversation' ? 'flex' : 'none';
+  document.getElementById('termContent').style.display = view === 'terminal' ? '' : 'none';
+  setPressed('conversationModeBtn', view === 'conversation');
+  setPressed('terminalModeBtn', view === 'terminal');
+  if (view === 'conversation') {
+    hideSearch();
+    setPressed('searchBtn', document.getElementById('historyFind').style.display !== 'none');
+    if (!history_.loaded) loadHistory();
+    else if (changed) conversationTick();
+  } else {
+    setPressed('searchBtn', document.getElementById('termSearch').style.display !== 'none');
+    if (changed) refreshPane();
+  }
+  updateSessionStatus();
+}
+
+// Kept for callers on older cached markup. No extra Back entry is created.
+function positionHistoryPanel() {}
+function toggleHistory() { setSessionView(sessionView === 'conversation' ? 'terminal' : 'conversation'); }
+function hideHistory() { document.getElementById('termHistory').style.display = 'none'; }
+function toggleSessionSearch() {
+  if (sessionView === 'conversation') toggleHistoryFind(); else toggleSearch();
+}
+function refreshSessionView() {
+  if (sessionView === 'conversation') followConversation(); else followPane();
+}
+
+function updateSessionStatus() {
+  const el = document.getElementById('sessionStatus');
+  if (!el) return;
+  const pane = paneById(activePane);
+  const state = pane && pane.status;
+  const connected = ws && ws.readyState === WebSocket.OPEN;
+  const label = connected
+    ? (state === 'blocked' ? 'Needs you' : state === 'working' ? 'Working' : state === 'done' ? 'Ready' : 'Connected')
+    : (ws && ws.readyState === WebSocket.CONNECTING ? 'Connecting…' : 'Offline');
+  if (el.textContent !== label) el.textContent = label;
+  el.dataset.state = connected ? (state || 'connected') : 'offline';
+}
+
+function resetConversation() {
+  invalidateHistory();
+  history_ = { turns: [], total: 0, hasMore: false, fileTruncated: false,
+    tools: history_.tools, loading: false, unavailable: null, loaded: false };
+  historyFollowing = true;
+  historyScrollTop = 0;
+  historyOpen.clear();
+  historyNodes.clear();
+  closeHistoryFind();
+  document.getElementById('historyTitle').textContent = 'Conversation';
+  document.getElementById('historyCount').textContent = '';
+  document.getElementById('historyContent').replaceChildren(histEdge('Loading conversation…'));
+  setPressed('historyToolsBtn', history_.tools);
+  updateHistoryStatus();
 }
 
 // The conversation, read from the agent's own transcript rather than the terminal. The relay keeps
@@ -399,30 +465,124 @@ const HISTORY_PAGE = 200;
 // characters from the same budget as the prose, so a page reaches less far back. The Tools chip
 // turns them off for exactly that case.
 let history_ = { turns: [], total: 0, hasMore: false, fileTruncated: false,
-                 tools: true, loading: false, unavailable: null };
+                 tools: true, loading: false, unavailable: null, loaded: false };
+let historyFollowing = true, historyEpoch = 0, historySerial = 0;
+let historyPending = null, historyReload = false, historyScrollTop = 0;
+const HISTORY_TIMEOUT = 20000;
+const historyNodes = new Map();
 
-function loadHistory(before) {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !activePane) return;
-  if (history_.loading) return;
-  if (!before) {
-    history_ = { turns: [], total: 0, hasMore: false, fileTruncated: false,
-                 tools: history_.tools, loading: true, unavailable: null };
-    closeHistoryFind();
-    document.getElementById('historyContent').innerHTML = '<div class="hist-edge">Loading…</div>';
-  } else {
-    history_.loading = true;
-    renderHistory();
+function invalidateHistory() {
+  historyEpoch++;
+  historyReload = false;
+  history_.loading = false;
+  // Keep the transport slot until its reply/timeout: changing tools or panes must not pile up
+  // transcript reads. The epoch makes that reply inert, even after closing and reopening a pane.
+}
+
+function finishHistoryRequest() {
+  if (historyPending) clearTimeout(historyPending.timer);
+  historyPending = null;
+  history_.loading = false;
+}
+
+function updateHistoryStatus(note) {
+  const el = document.getElementById('historyStatus');
+  const selected = selectionInside(document.getElementById('historyContent'));
+  const held = !historyFollowing || selected || !!document.getElementById('historyFind').value.trim();
+  // Background checks are transport activity, not a change in reading state. Keep this live
+  // region steady between requests, including its text node (screen readers announce mutations).
+  const label = note || (history_.error || (
+    !ws || ws.readyState !== WebSocket.OPEN ? 'Offline · reconnecting'
+    : history_.loading && !history_.loaded ? 'Loading conversation…'
+    : history_.unavailable ? (history_.retryAt ? 'Waiting for transcript · retries automatically' : 'Conversation unavailable')
+    : held ? 'Paused · reading earlier turns' : 'Following · checks every 3 seconds'));
+  if (el && el.textContent !== label) el.textContent = label;
+  const latest = document.getElementById('historyLatestBtn');
+  if (latest) latest.hidden = !held && !history_.error;
+}
+
+function conversationTick() {
+  if (!sessionVisible()) return;
+  updateHistoryStatus();
+  if (!historyFollowing || history_.error || history_.loading) return;
+  if (history_.unavailable && (!history_.retryAt || Date.now() < history_.retryAt)) return;
+  if (selectionInside(document.getElementById('historyContent'))) return;
+  if (document.getElementById('historyFind').value.trim()) return;
+  loadHistory(undefined, true);
+}
+
+function loadHistory(before, live = false) {
+  if (!sessionVisible() || sessionView !== 'conversation') return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) { updateHistoryStatus(); return; }
+  if (historyPending) {
+    if (historyPending.epoch !== historyEpoch) historyReload = true;
+    return;
   }
+  if (selectionInside(document.getElementById('historyContent'))) { updateHistoryStatus(); return; }
+  if (!before && !live) closeHistoryFind();
+  const request = {id: `history-${++historySerial}`, pane: activePane, epoch: historyEpoch,
+    tools: history_.tools, before, live};
+  historyPending = request;
+  history_.loading = true;
+  history_.error = null;
+  request.timer = setTimeout(() => {
+    if (historyPending !== request) return;
+    const current = request.epoch === historyEpoch && request.pane === activePane;
+    finishHistoryRequest();
+    if (current) historyFailure('Transcript request timed out. Retry or open Terminal.');
+    if (historyReload) { historyReload = false; loadHistory(); }
+  }, HISTORY_TIMEOUT);
+  updateHistoryStatus();
   ws.send(JSON.stringify({
-    type: 'get_history', pane_id: activePane, limit: HISTORY_PAGE,
+    type: 'get_history', pane_id: activePane, limit: HISTORY_PAGE, request_id: request.id,
     include_tools: history_.tools, ...(before ? { before } : {}),
   }));
 }
 
 function loadOlderHistory() {
-  if (history_.loading || !history_.hasMore || !history_.turns.length) return;
+  if (historyPending || !history_.hasMore || !history_.turns.length) return;
+  if (selectionInside(document.getElementById('historyContent'))) return;
+  historyFollowing = false;
   loadHistory(history_.turns[0].uuid);
 }
+
+function followConversation() {
+  if (selectionInside(document.getElementById('historyContent'))) {
+    updateHistoryStatus('Clear the text selection to follow the latest turns.');
+    return;
+  }
+  if (historyPending && historyPending.before) invalidateHistory();
+  historyFollowing = true;
+  history_.error = null;
+  history_.unavailable = null;
+  closeHistoryFind();
+  const el = document.getElementById('historyContent');
+  el.scrollTop = el.scrollHeight;
+  historyScrollTop = el.scrollTop;
+  loadHistory();
+}
+
+document.getElementById('historyContent').addEventListener('scroll', () => {
+  if (!sessionVisible() || sessionView !== 'conversation' || !history_.loaded) return;
+  const el = document.getElementById('historyContent');
+  // A smaller viewport (keyboard, composer, filter) also increases the bottom gap. Only an
+  // upward scroll is the reader asking to hold, not a resize or a sideways code-block pan.
+  if (el.scrollTop < historyScrollTop && el.scrollHeight - el.scrollTop - el.clientHeight > 48) historyFollowing = false;
+  historyScrollTop = el.scrollTop;
+  updateHistoryStatus();
+}, {passive: true});
+document.addEventListener('selectionchange', () => {
+  if (activePane && sessionView === 'conversation') updateHistoryStatus();
+});
+// Keep a following transcript at the bottom as the keyboard/composer changes the available
+// height. ResizeObserver watches the viewport box, not tool contents or individual turns.
+new ResizeObserver(() => {
+  const el = document.getElementById('historyContent');
+  if (!sessionVisible() || sessionView !== 'conversation' || !el.clientHeight || !history_.loaded
+      || !historyFollowing || selectionInside(el) || document.getElementById('historyFind').value.trim()) return;
+  el.scrollTop = el.scrollHeight;
+  historyScrollTop = el.scrollTop;
+}).observe(document.getElementById('historyContent'));
 
 // The filter opens IN PLACE of the conversation title, which is what keeps the header one row in
 // both states. Closing it clears the needle: a filter that is hiding turns while its input is not
@@ -433,6 +593,7 @@ function toggleHistoryFind() {
   input.style.display = on ? '' : 'none';
   document.getElementById('historyTitle').style.display = on ? 'none' : '';
   setPressed('historyFindBtn', on);
+  setPressed('searchBtn', on);
   if (on) { input.focus(); return; }
   const had = !!input.value;
   closeHistoryFind();
@@ -447,40 +608,93 @@ function closeHistoryFind() {
   input.style.display = 'none';
   document.getElementById('historyTitle').style.display = '';
   setPressed('historyFindBtn', false);
+  if (sessionView === 'conversation') setPressed('searchBtn', false);
 }
 
 function toggleHistoryTools() {
+  if (selectionInside(document.getElementById('historyContent'))) return;
   history_.tools = !history_.tools;
+  invalidateHistory();
+  historyFollowing = true;
+  history_.loaded = false;
+  history_.unavailable = null;
+  history_.error = null;
   setPressed('historyToolsBtn', history_.tools);
-  loadHistory();  // the server pages with tools filtered out, so the whole view has to be refetched
+  loadHistory();
 }
 
 // Merge a page in. `before` pages arrive as the turns immediately older than what we have, so they
 // go on the front; anything already held wins, in case a cursor was resolved loosely server-side.
 function receiveHistory(msg) {
-  const older = history_.turns.length > 0;
-  history_.loading = false;
+  const request = historyPending;
+  if (!request || msg.request_id !== request.id || msg.pane_id !== request.pane) return;
+  finishHistoryRequest();
+  if (request.epoch !== historyEpoch || request.pane !== activePane || request.tools !== history_.tools) {
+    if (historyReload) { historyReload = false; loadHistory(); }
+    return;
+  }
+  if (!sessionVisible() || sessionView !== 'conversation') return;
+  const el = document.getElementById('historyContent');
+  if (selectionInside(el) || (!request.before && !historyFollowing)
+      || (request.live && document.getElementById('historyFind').value.trim())) {
+    updateHistoryStatus();
+    return;
+  }
+  const older = !!request.before;
+  history_.loaded = true;
+  history_.error = null;
   history_.unavailable = msg.unavailable || null;
+  const pane = paneById(activePane);
+  const transient = msg.unavailable === 'no-log' || (msg.unavailable === 'no-session'
+    && pane && ['pi', 'claude'].includes(pane.agent));
+  history_.retryAt = transient ? Date.now() + 15000 : null;
   history_.total = msg.total || 0;
   history_.hasMore = !!msg.has_more;
   history_.fileTruncated = !!msg.file_truncated;
   const incoming = (msg.messages || []).filter(Boolean);
-  if (history_.unavailable) { history_.turns = []; }
+  if (history_.unavailable) history_.turns = [];
   else if (older) {
     const held = new Set(history_.turns.map(t => t.uuid));
     history_.turns = incoming.filter(t => !held.has(t.uuid)).concat(history_.turns);
-  } else {
-    history_.turns = incoming;
-  }
-  const title = (msg.title || '').trim();
-  document.getElementById('historyTitle').textContent = title || 'Conversation History';
-  const el = document.getElementById('historyContent');
-  // Anchor on content, not on offset: prepending older turns would otherwise yank the page out
-  // from under the reader's thumb.
+  } else history_.turns = incoming;
+  document.getElementById('historyTitle').textContent = (msg.title || '').trim() || 'Conversation';
   const previousHeight = el.scrollHeight, previousTop = el.scrollTop;
   renderHistory();
   if (older) el.scrollTop = previousTop + (el.scrollHeight - previousHeight);
-  else el.scrollTop = el.scrollHeight;  // newest turn is at the bottom
+  else if (historyFollowing) el.scrollTop = el.scrollHeight;
+  historyScrollTop = el.scrollTop;
+  updateHistoryStatus();
+}
+
+function historyFailure(message) {
+  history_.error = message;
+  if (!history_.turns.length) { history_.unavailable = 'error'; renderHistory(); }
+  updateHistoryStatus();
+}
+
+function receiveHistoryError(msg) {
+  if (msg.scope !== 'get_history') return false;
+  const request = historyPending;
+  if (!request || request.id !== msg.request_id || request.pane !== msg.pane_id) return true;
+  finishHistoryRequest();
+  if (request.epoch === historyEpoch && request.pane === activePane) {
+    historyFailure(msg.message || 'Could not read the transcript. Retry or open Terminal.');
+  }
+  if (historyReload) { historyReload = false; loadHistory(); }
+  return true;
+}
+
+function historyConnectionChanged(connected) {
+  finishHistoryRequest();
+  historyReload = false;
+  historyEpoch++;
+  if (connected) {
+    history_.error = null;
+    if (history_.unavailable === 'error') history_.unavailable = null;
+    if (activePane && sessionView === 'conversation') conversationTick();
+  }
+  updateHistoryStatus();
+  updateSessionStatus();
 }
 
 // Why the history panel is empty, in the user's terms. Each is an ordinary state, not an error.
@@ -489,7 +703,7 @@ const HISTORY_UNAVAILABLE = {
   'no-log': 'No transcript file was found for this pane\'s session yet.',
   'unsupported': 'This relay cannot read this agent\'s transcript format yet.',
   'disabled': 'Transcript history is switched off on this relay.',
-  'error': 'Could not read the transcript. Pull back and try again.',
+  'error': 'Could not read the transcript. Retry or open Terminal.',
 };
 
 const HISTORY_ROLE_CLASS = { user: 'msg-user', assistant: 'msg-assistant' };
@@ -500,9 +714,9 @@ const HISTORY_ROLE_CLASS = { user: 'msg-user', assistant: 'msg-assistant' };
 const historyOpen = new Set();
 
 function historyToolNode(turn) {
-  const row = document.createElement(turn.diff ? 'details' : 'div');
+  const row = document.createElement('details');
   row.className = 'msg tool' + (turn.error ? ' failed' : '');
-  const head = document.createElement(turn.diff ? 'summary' : 'div');
+  const head = document.createElement('summary');
   head.className = 'tool-head';
   const name = document.createElement('span');
   name.className = 'tool-name';
@@ -536,11 +750,23 @@ function historyToolNode(turn) {
     head.appendChild(stat);
   }
   row.appendChild(head);
+  // Opening details is reading, not following. Pause before the expanded body changes the
+  // scroll height; otherwise the next unchanged transcript poll would jump to its bottom.
+  head.addEventListener('click', () => {
+    if (!row.open) { historyFollowing = false; updateHistoryStatus(); }
+  });
+  row.open = historyOpen.has(turn.uuid);
+  row.addEventListener('toggle', () => {
+    if (row.open) historyOpen.add(turn.uuid); else historyOpen.delete(turn.uuid);
+  });
+  if (!turn.diff) {
+    const body = document.createElement('div');
+    body.className = 'tool-details';
+    body.textContent = [...new Set([turn.target, turn.text, turn.error ? turn.result : ''])]
+      .filter(Boolean).join('\n\n');
+    row.appendChild(body);
+  }
   if (turn.diff) {
-    row.open = historyOpen.has(turn.uuid);
-    row.addEventListener('toggle', () => {
-      if (row.open) historyOpen.add(turn.uuid); else historyOpen.delete(turn.uuid);
-    });
     row.appendChild(diffFragment(turn.diff));
     if (turn.diff_clipped) {
       const edge = document.createElement('div');
@@ -624,8 +850,18 @@ function renderHistory() {
   const el = document.getElementById('historyContent');
   const count = document.getElementById('historyCount');
   if (history_.unavailable) {
-    const copy = HISTORY_UNAVAILABLE[history_.unavailable] || 'Conversation history is unavailable.';
-    el.innerHTML = `<div class="hist-edge">${escapeHtml(copy)}</div>`;
+    const copy = history_.error || HISTORY_UNAVAILABLE[history_.unavailable] || 'Conversation history is unavailable.';
+    const edge = histEdge(copy);
+    const actions = document.createElement('div');
+    actions.className = 'hist-fallback-actions';
+    for (const [label, action] of [['Open terminal', () => setSessionView('terminal')], ['Retry', followConversation]]) {
+      const button = document.createElement('button');
+      button.textContent = label;
+      button.addEventListener('click', action);
+      actions.appendChild(button);
+    }
+    edge.appendChild(actions);
+    el.replaceChildren(edge);
     count.textContent = '';
     return;
   }
@@ -642,20 +878,40 @@ function renderHistory() {
     el.innerHTML = '<div class="hist-edge">This conversation has no turns yet.</div>';
     return;
   }
-  const out = document.createDocumentFragment();
-  if (history_.loading) out.appendChild(histEdge('Loading older…'));
-  else if (history_.hasMore) {
+  const out = [];
+  if (history_.hasMore) {
     const more = document.createElement('button');
     more.className = 'hist-more';
     more.textContent = 'Load older turns';
     more.addEventListener('click', loadOlderHistory);
-    out.appendChild(more);
+    out.push(more);
   }
-  else if (history_.fileTruncated) out.appendChild(histEdge('Older turns were not fetched from this host.'));
-  else out.appendChild(histEdge('Start of the conversation.'));
-  if (shown.length) shown.forEach(turn => out.appendChild(historyTurnNode(turn)));
-  else out.appendChild(histEdge('No loaded turn matches that.'));
-  el.replaceChildren(out);
+  else if (history_.fileTruncated) out.push(histEdge('Older turns were not fetched from this host.'));
+  else out.push(histEdge('Start of the conversation.'));
+  // Reuse unchanged turns, including expanded details and text nodes. Moving every node into a
+  // fragment would still disturb scroll anchors, even with a node cache.
+  const retained = new Set(history_.turns.map(t => t.uuid));
+  for (const id of historyNodes.keys()) if (!retained.has(id)) historyNodes.delete(id);
+  if (shown.length) shown.forEach(turn => {
+    const key = JSON.stringify(turn);
+    let cached = historyNodes.get(turn.uuid);
+    if (!cached || cached.key !== key) {
+      if (cached && cached.node.tagName === 'DETAILS' && cached.node.open) historyOpen.add(turn.uuid);
+      cached = {key, node: historyTurnNode(turn)};
+      cached.node.dataset.turnId = turn.uuid;
+      historyNodes.set(turn.uuid, cached);
+    }
+    out.push(cached.node);
+  });
+  else out.push(histEdge('No loaded turn matches that.'));
+  if (el.firstChild && el.firstChild.outerHTML === out[0].outerHTML) out[0] = el.firstChild;
+  let cursor = el.firstChild;
+  for (const node of out) {
+    if (node === cursor) cursor = cursor.nextSibling;
+    else el.insertBefore(node, cursor);
+  }
+  while (cursor) { const next = cursor.nextSibling; cursor.remove(); cursor = next; }
+  updateHistoryStatus();
 }
 
 function histEdge(text) {
@@ -900,7 +1156,8 @@ function sendText() {
     // respond_shell, which is the line that says a command was run rather than text typed.
     ws.send(JSON.stringify({type:'respond',pane_id:activePane,text:i.value}));
     i.value='';
-    setTimeout(refreshPane,400);
+    if (typeof resizeComposer === 'function') resizeComposer();
+    setTimeout(mirrorTick,400);
     return;
   }
   if(agent&&agent.status==='blocked') {
@@ -909,8 +1166,10 @@ function sendText() {
     ws.send(JSON.stringify({type:'send_text',pane_id:activePane,text:i.value}));
     ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:['Enter']}));
   }
-  i.value=''; setTimeout(refreshPane,500);
+  i.value='';
+  if (typeof resizeComposer === 'function') resizeComposer();
+  setTimeout(mirrorTick,500);
 }
-function sendKey(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:[k]}));setTimeout(refreshPane,300);}
-function sendKeys(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:k}));setTimeout(refreshPane,300);}
+function sendKey(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:[k]}));setTimeout(mirrorTick,300);}
+function sendKeys(k){if(!ws||!activePane)return;ws.send(JSON.stringify({type:'send_keys',pane_id:activePane,keys:k}));setTimeout(mirrorTick,300);}
 

@@ -2582,7 +2582,50 @@ class RelayPaneFieldTests(unittest.TestCase):
             with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()):
                 asyncio.run(relay.handle_client(ws))
             self.assertEqual(json.loads(ws.sent[0]),
-                             {"type": "error", "message": "invalid history cursor"})
+                             {"type": "error", "message": "invalid history cursor",
+                              "pane_id": pane_id, "scope": "get_history"})
+
+    def test_history_request_id_is_echoed_on_success_and_scoped_errors(self):
+        for extra, expected in [({}, "history"), ({"limit": "no"}, "error"),
+                                ({"before": {}}, "error"), ({"pane_id": "missing"}, "error")]:
+            with self.subTest(extra=extra), loaded_relay() as relay:
+                relay.known_panes.add("w0:p1")
+                request = {"type": "get_history", "pane_id": "w0:p1",
+                           "request_id": "history-42", **extra}
+                ws = _FakeWebSocket([json.dumps(request)])
+                with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()):
+                    asyncio.run(relay.handle_client(ws))
+                reply = json.loads(ws.sent[0])
+                self.assertEqual(reply["type"], expected)
+                self.assertEqual(reply["request_id"], "history-42")
+                self.assertEqual(reply["pane_id"], request["pane_id"])
+                if expected == "error":
+                    self.assertEqual(reply["scope"], "get_history")
+
+    def test_history_request_ids_are_bounded_and_read_exceptions_are_scoped(self):
+        for request_id in ["", "x" * 129, {"object": True}, 42]:
+            with self.subTest(request_id=request_id), loaded_relay() as relay:
+                relay.known_panes.add("w0:p1")
+                ws = _FakeWebSocket([json.dumps({"type": "get_history", "pane_id": "w0:p1",
+                                                "request_id": request_id})])
+                with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                     mock.patch.object(relay.transcript, "history") as reader:
+                    asyncio.run(relay.handle_client(ws))
+                reader.assert_not_called()
+                reply = json.loads(ws.sent[0])
+                self.assertEqual(reply["message"], "invalid history request_id")
+                self.assertNotIn("request_id", reply)
+        with loaded_relay() as relay:
+            relay.known_panes.add("w0:p1")
+            ws = _FakeWebSocket([json.dumps({"type": "get_history", "pane_id": "w0:p1",
+                                            "request_id": "history-2"})])
+            with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
+                 mock.patch.object(relay.transcript, "history", side_effect=OSError("unreadable")):
+                asyncio.run(relay.handle_client(ws))
+            reply = json.loads(ws.sent[0])
+            self.assertEqual(reply["scope"], "get_history")
+            self.assertEqual(reply["request_id"], "history-2")
+            self.assertEqual(reply["type"], "error")
 
     def test_get_history_on_a_remote_pane_runs_one_locked_ssh_probe(self):
         pane_id = "w0:p1"

@@ -1,3 +1,53 @@
+// Keep the phone composer useful without spending a permanent row on terminal-only actions.
+function resizeComposer() {
+  const input = document.getElementById('termInput');
+  input.style.height = 'auto';
+  input.style.height = Math.min(132, Math.max(44, input.scrollHeight + 2)) + 'px';
+}
+
+function hideComposerTools() {
+  document.getElementById('composerTools').hidden = true;
+  document.getElementById('composerToolsBtn').setAttribute('aria-expanded', 'false');
+}
+
+function toggleComposerTools() {
+  const tools = document.getElementById('composerTools');
+  const open = tools.hidden;
+  tools.hidden = !open;
+  document.getElementById('composerToolsBtn').setAttribute('aria-expanded', String(open));
+  if (!open) showDock(null);
+}
+
+function closeSessionActions() {
+  document.getElementById('sessionActions').open = false;
+}
+
+document.addEventListener('click', event => {
+  if (!event.target.closest('#sessionActions')) closeSessionActions();
+});
+document.addEventListener('keydown', event => {
+  if (event.key !== 'Escape') return;
+  const menu = document.getElementById('sessionActions');
+  if (!menu.open) return;
+  closeSessionActions();
+  menu.querySelector('summary').focus();
+  event.preventDefault();
+});
+
+// Android's browser chrome and iOS's keyboard can resize only the visual viewport. Keep the
+// composer above it, but never fight a reader who is pinch-zooming the page.
+function syncSessionViewport() {
+  const viewport = window.visualViewport;
+  if (!viewport || viewport.scale !== 1) return;
+  const root = document.documentElement;
+  root.style.setProperty('--session-viewport-height', `${viewport.height}px`);
+  root.style.setProperty('--session-viewport-top', `${viewport.offsetTop}px`);
+}
+window.visualViewport?.addEventListener('resize', syncSessionViewport);
+window.visualViewport?.addEventListener('scroll', syncSessionViewport);
+window.addEventListener('resize', syncSessionViewport);
+syncSessionViewport();
+
 // --- Nav Tray (collie-style) ---
 let keyQueue = [], armedMod = null, ctrlConfirm = null;
 const CTRL_PRESETS = [
@@ -92,7 +142,7 @@ function quickSend(text) {
   ws.send(JSON.stringify({type:'send_text', pane_id: activePane, text: text}));
   ws.send(JSON.stringify({type:'send_keys', pane_id: activePane, keys:['Enter']}));
   showDock(null);
-  setTimeout(refreshPane, 500);
+  setTimeout(mirrorTick, 500);
 }
 
 function switchKeyTab(tab) {
@@ -157,15 +207,16 @@ function respond(t, promptId){
   if(window.cue)cue('success');
   ws.send(JSON.stringify({type:'respond',pane_id:activePane,prompt_id:promptId||'',text:t}));
   document.getElementById('quickActions').innerHTML='';
-  setTimeout(refreshPane,500);
+  setTimeout(mirrorTick,500);
 }
 let imeComposing = false, imeEndedAt = 0;
 {
   const ti = document.getElementById('termInput');
+  ti.addEventListener('input', resizeComposer);
   ti.addEventListener('compositionstart',()=>{imeComposing=true;});
   ti.addEventListener('compositionend',()=>{imeComposing=false;imeEndedAt=Date.now();});
   ti.addEventListener('keydown',e=>{
-    if(e.key!=='Enter')return;
+    if(e.key!=='Enter'||e.shiftKey)return;
     // Enter belongs to the IME while composing - intercepting it drops the preedit
     if(imeComposing||e.isComposing||e.keyCode===229)return;
     // Some Chinese IMEs emit a stray Enter right after compositionend
@@ -186,9 +237,6 @@ document.getElementById('termContent').addEventListener('scroll', function() {
   const moved = el.scrollTop !== mirrorScrollTop;
   mirrorScrollTop = el.scrollTop;
   if (moved && el.scrollTop === 0 && el.scrollHeight > el.clientHeight) loadMore();
-});
-document.getElementById('historyContent').addEventListener('scroll', function() {
-  if (this.scrollTop <= 4) loadOlderHistory();
 });
 window.addEventListener('resize', positionHistoryPanel);
 

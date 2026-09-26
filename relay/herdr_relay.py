@@ -40,6 +40,18 @@ except ModuleNotFoundError:
     transcript = module_from_spec(_transcript_spec)
     _transcript_spec.loader.exec_module(transcript)
 
+try:
+    import command_catalog
+except ModuleNotFoundError:
+    from importlib.util import module_from_spec, spec_from_file_location
+
+    _commands_spec = spec_from_file_location(
+        "herdr_remote_command_catalog",
+        os.path.join(os.path.dirname(__file__), "command_catalog.py"),
+    )
+    command_catalog = module_from_spec(_commands_spec)
+    _commands_spec.loader.exec_module(command_catalog)
+
 def _get_log_dir():
     if sys.platform == "darwin":
         return os.path.expanduser("~/Library/Logs/herdr-remote")
@@ -3204,10 +3216,60 @@ async def handle_client(ws):
                         pane_process, pane_id, remote=remote
                     )
                 await ws.send(json.dumps(reply))
+            elif msg_type == "get_commands":
+                pane_id = msg.get("pane_id")
+                request_id = msg.get("request_id")
+                valid_request_id = (isinstance(request_id, str)
+                                    and 0 < len(request_id) <= 128)
+                commands_scope = {}
+                if isinstance(pane_id, str) and len(pane_id) <= 256:
+                    commands_scope["pane_id"] = pane_id
+                if valid_request_id:
+                    commands_scope["request_id"] = request_id
+
+                def commands_error(message, scope=commands_scope):
+                    return {"type": "error", "scope": "get_commands", "message": message,
+                            **scope}
+
+                if request_id is not None and not valid_request_id:
+                    await ws.send(json.dumps(commands_error("invalid commands request_id")))
+                    continue
+                if not isinstance(pane_id, str) or pane_id not in known_panes:
+                    await ws.send(json.dumps(commands_error("unknown pane_id")))
+                    continue
+                pane = agent_cache.get(pane_id) or {}
+                try:
+                    body = await asyncio.to_thread(
+                        command_catalog.commands,
+                        pane_session_map.get(pane_id),
+                        remote=pane_remote_map.get(pane_id),
+                        agent=pane.get("agent", ""),
+                    )
+                except Exception:
+                    # Neither filesystem paths nor exception details belong in logs or replies.
+                    await ws.send(json.dumps(commands_error("Could not read runtime commands")))
+                    continue
+                await ws.send(json.dumps({"type": "commands", **commands_scope, **body}))
             elif msg_type == "get_history":
                 pane_id = msg["pane_id"]
+                request_id = msg.get("request_id")
+                # Correlation is optional for older clients, but bounded: never echo arbitrary
+                # objects or an unbounded string into a response. Errors retain the same scope.
+                valid_request_id = (isinstance(request_id, str)
+                                    and 0 < len(request_id) <= 128)
+                history_scope = {"pane_id": pane_id}
+                if valid_request_id:
+                    history_scope["request_id"] = request_id
+
+                def history_error(message, scope=history_scope):
+                    return {"type": "error", "scope": "get_history", "message": message,
+                            **scope}
+
+                if request_id is not None and not valid_request_id:
+                    await ws.send(json.dumps(history_error("invalid history request_id")))
+                    continue
                 if pane_id not in known_panes:
-                    await ws.send(json.dumps({"type": "error", "message": "unknown pane_id"}))
+                    await ws.send(json.dumps(history_error("unknown pane_id")))
                     continue
                 # History comes from the agent's own transcript, not from the terminal: an agent
                 # TUI runs on the alternate screen, so herdr kept no scrollback for it, and the
@@ -3221,30 +3283,35 @@ async def handle_client(ws):
                 try:
                     limit = int(msg.get("limit", transcript.DEFAULT_LIMIT))
                 except (TypeError, ValueError):
-                    await ws.send(json.dumps({"type": "error", "message": "invalid history limit"}))
+                    await ws.send(json.dumps(history_error("invalid history limit")))
                     continue
                 before = msg.get("before")
                 if before is not None and not isinstance(before, str):
-                    await ws.send(json.dumps({"type": "error", "message": "invalid history cursor"}))
+                    await ws.send(json.dumps(history_error("invalid history cursor")))
                     continue
                 remote = pane_remote_map.get(pane_id)
                 pane = agent_cache.get(pane_id) or {}
                 # Off the event loop: a cold read of the biggest transcript on this machine (33MB)
                 # measured 0.29s, and a remote one is an SSH round trip. Neighbouring handlers
                 # block the loop on their subprocess; this one is too slow to join them.
-                body = await asyncio.to_thread(
-                    transcript.history,
-                    pane_session_map.get(pane_id),
-                    remote=remote,
-                    limit=limit,
-                    before=before or None,
-                    include_tools=bool(msg.get("include_tools")),
-                    agent=pane.get("agent", ""),
-                    ssh_args=SSH_BASE_ARGS,
-                    remote_runner=transcript_ssh,
-                    log=log,
-                )
-                await ws.send(json.dumps({"type": "history", "pane_id": pane_id, **body}))
+                try:
+                    body = await asyncio.to_thread(
+                        transcript.history,
+                        pane_session_map.get(pane_id),
+                        remote=remote,
+                        limit=limit,
+                        before=before or None,
+                        include_tools=bool(msg.get("include_tools")),
+                        agent=pane.get("agent", ""),
+                        ssh_args=SSH_BASE_ARGS,
+                        remote_runner=transcript_ssh,
+                        log=log,
+                    )
+                except Exception:
+                    log.exception("transcript read failed for %s", pane_id)
+                    await ws.send(json.dumps(history_error("Could not read the transcript")))
+                    continue
+                await ws.send(json.dumps({"type": "history", **history_scope, **body}))
             elif msg_type == "send_keys":
                 pane_id = msg["pane_id"]
                 request_id = msg.get("request_id")

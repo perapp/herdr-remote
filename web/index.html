@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content">
 <meta name="apple-mobile-web-app-capable" content="yes">
 <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
 <meta name="theme-color" content="#f5f5f5" media="(prefers-color-scheme: light)">
@@ -112,9 +112,21 @@ document.addEventListener('DOMContentLoaded', () => bind());
   <div class="term-header">
     <button class="back" onclick="closeTerminal()" aria-label="Back to agent list"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 18-6-6 6-6"/></svg></button>
     <span class="title" id="termTitle"></span>
-    <button class="search-btn icon-toggle" id="searchBtn" aria-pressed="false" onclick="toggleSearch()" aria-label="Find in output"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg></button>
-    <button class="history-btn icon-toggle" id="historyBtn" aria-pressed="false" onclick="toggleHistory()" aria-label="Conversation history"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/></svg></button>
-    <button class="refresh-btn" onclick="followPane()" aria-label="Refresh pane"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 16h5v5"/></svg></button>
+    <span id="sessionStatus" class="session-status" role="status"></span>
+    <details class="session-menu" id="sessionActions">
+      <summary aria-label="Session actions">⋯</summary>
+      <div class="session-menu-items">
+        <button class="search-btn icon-toggle" id="searchBtn" aria-pressed="false" onclick="closeSessionActions(); toggleSessionSearch()">Find in view</button>
+        <button class="refresh-btn" onclick="closeSessionActions(); refreshSessionView()">Refresh / latest</button>
+        <button class="hist-toggle" id="historyToolsBtn" aria-pressed="true" onclick="closeSessionActions(); toggleHistoryTools()">Show tool calls</button>
+        <button onclick="closeSessionActions(); toggleSettings()">Settings</button>
+        <button onclick="closeSessionActions(); toggleTimeline()">Timeline</button>
+      </div>
+    </details>
+  </div>
+  <div class="session-modes" id="sessionModes" role="group" aria-label="Session view">
+    <button id="conversationModeBtn" class="history-btn" aria-pressed="false" aria-controls="termHistory" onclick="setSessionView('conversation')">Conversation</button>
+    <button id="terminalModeBtn" aria-pressed="true" aria-controls="termContent" onclick="setSessionView('terminal')">Terminal</button>
   </div>
   <!-- space > tab > pane, the same three levels herdr itself has. ONE row says the lower two, read
        left to right the way a multiplexer's status line is: every pane in this space, in herdr's
@@ -127,19 +139,19 @@ document.addEventListener('DOMContentLoaded', () => bind());
   <div class="term-sibs" id="termSibs" style="display:none">
     <div class="term-siblings" id="termSiblings" aria-label="Panes in this space, by tab"></div>
   </div>
-  <div class="term-history" id="termHistory" style="display:none">
+  <section class="term-history" id="termHistory" aria-label="Conversation" style="display:none">
     <div class="hist-bar">
-      <!-- The title and the filter share this slot: exactly one of them is in the flow at a time,
-           which is what keeps the header one row tall in both states. -->
-      <span class="hist-title" id="historyTitle">Conversation History</span>
-      <input class="hist-find" id="historyFind" type="text" placeholder="Filter loaded turns..." autocomplete="off" oninput="renderHistory()" style="display:none" />
+      <span class="hist-title" id="historyTitle">Conversation</span>
+      <input class="hist-find" id="historyFind" type="search" aria-label="Filter loaded turns" placeholder="Filter loaded turns…" autocomplete="off" oninput="renderHistory()" style="display:none" />
       <span class="hist-count" id="historyCount"></span>
-      <button class="hist-toggle" id="historyFindBtn" aria-pressed="false" onclick="toggleHistoryFind()" title="Filter loaded turns">Find</button>
-      <button class="hist-toggle" id="historyToolsBtn" aria-pressed="true" onclick="toggleHistoryTools()" title="Show tool calls">Tools</button>
-      <button class="hist-close" onclick="toggleHistory()" aria-label="Close history"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6 6 18M6 6l12 12"/></svg></button>
+      <button class="hist-toggle" id="historyFindBtn" aria-pressed="false" onclick="toggleHistoryFind()" aria-label="Close conversation filter">Done</button>
     </div>
-    <div class="hist-body" id="historyContent"></div>
-  </div>
+    <div class="hist-body" id="historyContent" tabindex="0" aria-label="Conversation messages"></div>
+    <div class="conversation-footer">
+      <span id="historyStatus" role="status"></span>
+      <button id="historyLatestBtn" onclick="followConversation()" hidden>Latest ↓</button>
+    </div>
+  </section>
   <div class="term-search" id="termSearch" style="display:none">
     <input id="searchInput" type="text" placeholder="Find in output..." autocomplete="off" oninput="doSearch()" />
     <span id="searchCount"></span>
@@ -149,12 +161,15 @@ document.addEventListener('DOMContentLoaded', () => bind());
   </div>
   <div class="term-content" id="termContent">Loading…</div>
   <div class="quick-actions" id="quickActions"></div>
+  <div class="composer-tools" id="composerTools" hidden role="group" aria-label="Message tools">
+    <button class="term-cmd" onclick="hideComposerTools(); openCommandPalette()" aria-label="Commands">/ Commands</button>
+    <button class="dock-toggle dock-quick" id="quickDockBtn" aria-pressed="false" onclick="toggleQuickDock()">Quick actions</button>
+    <button class="dock-toggle dock-keys" id="keysDockBtn" aria-pressed="false" onclick="toggleKeysDock()">Keys</button>
+  </div>
   <div class="term-input">
-    <button class="term-cmd" onclick="openCommandPalette()" aria-label="Commands">/</button>
-    <input id="termInput" placeholder="Type…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
-    <button class="dock-toggle dock-quick" id="quickDockBtn" aria-pressed="false" onclick="toggleQuickDock()" aria-label="Quick actions"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z"/></svg></button>
-    <button class="dock-toggle dock-keys" id="keysDockBtn" aria-pressed="false" onclick="toggleKeysDock()" aria-label="Keys"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M6 8h.001M10 8h.001M14 8h.001M18 8h.001M8 12h.001M12 12h.001M16 12h.001M7 16h10"/></svg></button>
-    <button class="term-send" onclick="sendText()" aria-label="Send"><svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
+    <button class="composer-tools-btn" id="composerToolsBtn" onclick="toggleComposerTools()" aria-expanded="false" aria-controls="composerTools" aria-label="Message tools"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg></button>
+    <textarea id="termInput" rows="1" aria-label="Message or command" placeholder="Message…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"></textarea>
+    <button class="term-send" onclick="sendText()" aria-label="Send"><svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" stroke="none"><path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z"/></svg></button>
   </div>
   <div class="term-keys" id="termKeys" style="display:none">
     <!-- Key queue strip (visible when composing) -->
@@ -211,15 +226,26 @@ document.addEventListener('DOMContentLoaded', () => bind());
   <div id="contextMenuItems"></div>
 </div>
 
-<div id="cmdPalette" style="display:none;position:fixed;inset:0;z-index:100;">
-  <div onclick="closePalette()" style="position:absolute;inset:0;background:rgba(0,0,0,0.5)"></div>
-  <div style="position:absolute;bottom:0;left:50%;transform:translateX(-50%);width:100%;max-width:420px;max-height:50dvh;background:var(--surface);border-top-left-radius:16px;border-top-right-radius:16px;border-top:1px solid var(--border);display:flex;flex-direction:column;padding-bottom:calc(8px + env(safe-area-inset-bottom,0px))">
-    <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:8px">
-      <span style="font-size:0.8rem;font-weight:600;flex:1">Commands</span>
-      <button onclick="closePalette()" aria-label="Close" style="background:none;border:none;color:var(--muted);font-size:1.2rem;cursor:pointer">✕</button>
+<div id="cmdPalette" style="display:none" role="dialog" aria-modal="true" aria-labelledby="cmdTitle">
+  <div class="cmd-backdrop" onclick="closePalette()"></div>
+  <div class="cmd-panel">
+    <div class="cmd-heading">
+      <h2 id="cmdTitle">Commands</h2>
+      <button onclick="closePalette()" aria-label="Close commands">✕</button>
     </div>
-    <input id="cmdSearch" type="text" placeholder="Search commands…" autocomplete="off" autocorrect="off" style="margin:8px 12px;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:14px" oninput="filterCommands()" />
-    <div id="cmdList" style="overflow-y:auto;padding:4px 12px;"></div>
+    <input id="cmdSearch" type="search" aria-label="Search commands" placeholder="Search commands…" autocomplete="off" autocorrect="off" oninput="filterCommands()" />
+    <p id="cmdStatus" role="status"></p>
+    <div class="cmd-scroll">
+      <div id="cmdList"></div>
+      <details id="cmdShortcutEditor">
+        <summary>Saved shortcuts</summary>
+        <label id="cmdShortcutLabel" for="cmdShortcuts">Shortcuts in this browser</label>
+        <textarea id="cmdShortcuts" rows="4" spellcheck="false" placeholder="/my-command | Description"></textarea>
+        <p class="cmd-hint">One /command | description per line. These are your shortcuts, not discovered commands.</p>
+        <button class="cmd-save" onclick="saveCommandShortcuts()">Save shortcuts</button>
+        <p id="cmdShortcutStatus" role="status"></p>
+      </details>
+    </div>
   </div>
 </div>
 

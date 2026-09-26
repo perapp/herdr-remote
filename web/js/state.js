@@ -237,10 +237,12 @@ function hidePanel() {
   document.getElementById('timelineView').style.display = 'none';
   const toSession = panelReturn === 'terminal';
   panelReturn = null;
-  // Restoring the agent list unconditionally used to leave it rendered under the still-active
-  // session view; the session keeps polling while the panel is up, so it comes back current.
+  // Polling pauses while the panel covers the session; restore it before requesting an update.
   document.getElementById('agentListView').style.display = toSession ? 'none' : '';
-  if (toSession) document.getElementById('terminalView').classList.add('active');
+  if (toSession) {
+    document.getElementById('terminalView').classList.add('active');
+    mirrorTick();
+  }
 }
 
 function renderTimeline() {
@@ -355,7 +357,20 @@ function connect() {
     if (typeof resyncPushSubscription === 'function') resyncPushSubscription(); };
   sock.onclose = () => { if (ws !== sock) return; setStatus('disconnected'); scheduleReconnect(); };
   sock.onerror = () => { if (ws !== sock) return; setStatus('disconnected'); };
-  sock.onmessage = (e) => { if (ws !== sock) return; handleMessage(JSON.parse(e.data)); };
+  sock.onmessage = (e) => {
+    if (ws !== sock) return;
+    receiveSessionMessage(JSON.parse(e.data));
+  };
+}
+
+// Route history before the general handler: an old pane's reply must release the single
+// transcript request slot too, even though it must never paint the pane now on screen.
+function receiveSessionMessage(msg) {
+  if (msg.type === 'commands' || (msg.type === 'error' && msg.scope === 'get_commands')) { receiveCommands(msg); return; }
+  if (msg.type === 'history') { receiveHistory(msg); return; }
+  if (msg.type === 'error' && receiveHistoryError(msg)) return;
+  handleMessage(msg);
+  updateSessionStatus();
 }
 
 function scheduleReconnect() {
@@ -367,7 +382,9 @@ function scheduleReconnect() {
 // comes back reading offline until something pokes it. Poke it on the way in, but only when the
 // socket is actually gone -- CONNECTING and OPEN are left alone so this cannot cut a live one.
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && (!ws || ws.readyState > WebSocket.OPEN)) connect();
+  if (document.visibilityState !== 'visible') return;
+  if (!ws || ws.readyState > WebSocket.OPEN) connect();
+  else mirrorTick();
 });
 
 function setStatus(s) {
@@ -376,6 +393,7 @@ function setStatus(s) {
   dot.style.background = s==='connected'?'var(--green)':s==='connecting'?'var(--orange)':'var(--red)';
   label.textContent = s==='connected'?'live':s==='connecting'?'connecting…':'offline';
   label.style.color = s==='connected'?'var(--green)':s==='connecting'?'var(--orange)':'var(--red)';
+  if (typeof historyConnectionChanged === 'function') historyConnectionChanged(s === 'connected');
 }
 
 function showSetup() {

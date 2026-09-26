@@ -252,14 +252,13 @@ class WebShellPaneSessionTests(unittest.TestCase):
     def sent(self):
         return self.page.evaluate("window.__sent")
 
-    def test_opening_one_hides_the_history_button(self):
-        """A terminal has no transcript -- the relay would answer no-session either way."""
+    def test_shell_defaults_to_terminal_but_conversation_is_an_explicit_choice(self):
+        """Shells open the terminal; switching to Conversation can explain no-session."""
         self.page.evaluate("openTerminal('wE:p2')")
-        self.assertEqual(
-            self.page.eval_on_selector(".history-btn", "e => getComputedStyle(e).display"), "none")
-        self.page.evaluate("openTerminal('wE:pH')")
-        self.assertNotEqual(
-            self.page.eval_on_selector(".history-btn", "e => getComputedStyle(e).display"), "none")
+        self.assertEqual(self.page.evaluate("sessionView"), "terminal")
+        self.assertTrue(self.page.locator("#conversationModeBtn").is_visible())
+        self.page.evaluate("openTerminal('wE:pH'); setSessionView('conversation')")
+        self.assertEqual(self.page.evaluate("sessionView"), "conversation")
 
     def test_scrollback_is_offered_where_there_is_a_ring_and_not_where_there_is_none(self):
         """`canLoadMore` asks what a read could return, which is the one thing scrollback says.

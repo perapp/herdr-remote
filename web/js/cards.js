@@ -446,7 +446,7 @@ function submitQuestion(promptId) {
   ws.send(JSON.stringify({type:'question_submit', pane_id:activePane, prompt_id:promptId||''}));
   document.getElementById('quickActions').replaceChildren();
   document.getElementById('actionKeys').replaceChildren();
-  setTimeout(refreshPane, 500);
+  setTimeout(mirrorTick, 500);
 }
 
 
@@ -489,8 +489,11 @@ function openTerminal(paneId) {
   // The reading state goes with them, for the same reason: a re-entry is a title refresh, and
   // resetting it on one would drop a reader who had paged back to the live screen the moment
   // their agent asked a question -- the one moment they are most likely to be reading.
-  if (activePane !== paneId) {
+  const switched = activePane !== paneId;
+  if (switched) {
+    resetSessionControls(paneId);
     hideHistory(); hideSearch(); clearPaneMirror();
+    resetConversation();
     paneLines = PANE_LINES_BASE; paneFollowing = true; userScrolledUp = false;
     // A real switch is one of the two moments the sibling row may place itself; dropping the anchor
     // here is what asks for it, and what keeps a re-entry from asking again.
@@ -504,14 +507,12 @@ function openTerminal(paneId) {
   document.getElementById('termTitle').textContent = a
     ? `${a.label||a.workspace_label||a.project} · ${a.agent}`
     : shell ? `${shell.label||shell.project||shell.pane_id} · ${shell.pane_id}` : paneId;
-  // A pane that names no agent session has no transcript to show. `false` only -- undefined means
-  // the relay doesn't report it, and the button stays. A terminal never has one.
-  const historyBtn = document.querySelector('.history-btn');
-  if (historyBtn) historyBtn.style.display = (shell || (a && a.has_session === false)) ? 'none' : '';
   renderSiblings();
   document.getElementById('agentListView').style.display = 'none';
-  if (refreshInterval) clearInterval(refreshInterval);
-  document.getElementById('terminalView').classList.add('active');
+  // A blocked broadcast refreshes the dock even while Settings covers this pane. It must not
+  // reactivate the session over that panel or restart its hidden polling.
+  if (switched || !panelIsOpen()) document.getElementById('terminalView').classList.add('active');
+  if (switched && typeof resizeComposer === 'function') resizeComposer();
   // AFTER the view is displayed: renderSiblings ran while it was still display:none, where every
   // rect is zero, no chip can be found to be off screen, and scrollLeft cannot be written either --
   // so it deliberately left the row unanchored for this call to place. Guarded the same way, since
@@ -523,6 +524,21 @@ function openTerminal(paneId) {
   const ak = document.getElementById('actionKeys');
   qa.replaceChildren();
   ak.replaceChildren();
+  if (a && a.status === 'blocked') {
+    const context = document.createElement('div');
+    context.className = 'qa-context';
+    const heading = document.createElement('strong');
+    heading.textContent = 'Needs your response';
+    const snapshot = document.createElement('div');
+    snapshot.className = 'qa-context-text';
+    const prompt = typeof a.prompt === 'string' ? a.prompt : typeof a.question === 'string' ? a.question : '';
+    snapshot.textContent = prompt.trim() || 'Inspect the live request in Terminal before responding.';
+    const inspect = document.createElement('button');
+    inspect.textContent = 'Open terminal';
+    inspect.addEventListener('click', () => setSessionView('terminal'));
+    context.append(heading, snapshot, inspect);
+    qa.appendChild(context);
+  }
   if (a&&a.status==='blocked'&&a.text_field) {
     // A text field on the pane has focus, which the relay reports because nothing else in the
     // message says so: Claude's "Type something." turns one of the menu's own rows into an input
@@ -652,7 +668,14 @@ function openTerminal(paneId) {
       }
     }
   }
-  refreshPane();
-  refreshInterval = setInterval(mirrorTick, 3000);
+  updateSessionStatus();
+  if (switched) {
+    const view = sessionViewChoices.get(paneId) || defaultSessionView(a);
+    const was = sessionView;
+    setSessionView(view, false);
+    if (view === 'terminal' && was === view) refreshPane();
+    if (refreshInterval) clearInterval(refreshInterval);
+    refreshInterval = setInterval(mirrorTick, 3000);
+  }
 }
 

@@ -177,6 +177,42 @@ both directions, the stale pin coming off, the pre-paint stamp surviving a reloa
 contrast on each saturated fill, and "monospace" as two equal-length strings of different glyphs
 measuring the same width.
 
+Conversation is a primary session view, alongside Terminal. On viewports up to 600px, Pi and
+Claude default to Conversation; shells and other agents default to Terminal. An explicit mode
+choice is remembered per pane for the browser session. The conversation panel is an in-flow flex
+child, not an overlay: the approval dock and composer remain accessible. Both modes share the
+session header and a labelled switch; the global header is hidden while a phone session is open.
+
+The Commands palette requests `get_commands` on open rather than guessing custom commands from
+files. `pi-extension/commands.ts` publishes `pi.getCommands()` into a private, bounded sidecar next
+beside the allocated session JSONL path, even before a fresh session saves its first message.
+`relay/command_catalog.py` reads only the validated server-side session ref, with containment,
+regular-file, size, schema and freshness checks. Command discovery must not depend on the transcript
+file already existing; only the catalog is read, and discovery never creates an empty transcript. Commands are rendered as
+DOM text and buttons, not interpolated HTML/onclick strings. Built-ins are labelled fallbacks;
+user-configured shortcuts are browser-local and agent-scoped. Runtime entries override duplicate
+fallbacks. Correlation rejects replies for a different pane/request/connection. SSH catalogs are
+currently explicitly unavailable, not scanned or guessed. See `pi-extension/README.md`.
+
+The conversation status describes reading state, not network activity: routine polls leave its
+text and text node unchanged. Initial loading, paused reading, offline and errors still update it.
+
+`conversationTick` reads the saved transcript periodically, not a token stream. At most one history
+request is outstanding. A bounded `request_id` is echoed by the relay (including scoped errors),
+while a client epoch rejects stale pane/filter responses. Reading older turns, filtering, and
+selection pause following; Latest resumes it. Unchanged turn nodes survive refreshes, and expanded
+diffs stay open. Unavailable/error states offer Retry and Open terminal instead of a blank page.
+
+The composer is an expanding textarea (Enter sends, Shift+Enter inserts a newline; IME composition
+still owns its Enter). Commands and the two docks live behind Message tools. On phones the session
+follows `visualViewport` height/offset so the keyboard does not cover the composer; pinch zoom is
+not overridden. Session actions (Find, Refresh, Tools, Settings, Timeline) are in a disclosure menu.
+
+The conversation renderer uses a system proportional font for prose, retaining monospace for
+metadata, code, tools and the raw terminal. Bare HTTP(S) links show a compact destination with Copy;
+the original URL remains in href/clipboard, and no preview requests are made. Code and explicit
+Markdown link labels stay verbatim. Clipboard copying has a user-initiated fallback for HTTP LANs.
+
 The history panel renders a conversation, not a log: a person's turn is a tinted bubble, the
 agent's is full-width markdown, a tool call is one compact row, and a file edit opens into its
 diff. Two renderers do that work, and both build **DOM nodes, never HTML strings** — every
@@ -210,16 +246,9 @@ holds and is what makes the escaping provable rather than remembered.
   reopens it as `America/Los_Angeles`, because "the reader's zone" is exactly the claim and the
   runner's own clock would make it a test of the runner.
 
-The panel's header is **one row**, and the filter opens *in place of* the conversation title
-(`toggleHistoryFind`) rather than beside it. It was two rows — a title bar over a filter bar,
-measured **80px of a 390×844 screen, 9.5%, spent before a single turn had rendered** — and the
-filter, which is only wanted while you are looking for something, paid for its input box
-permanently. It is 35px now, and the same 35px in both states: every child of that flex row is
-pinned to 22px, because the row's height is set by its tallest child and an input even two pixels
-taller than a chip would make the header jump every time the filter opened. Closing the filter
-**drops the needle** — one still hiding turns while its input is off screen would read as a
-conversation with pieces missing — and a fresh page closes it, so a needle cannot survive into the
-next conversation.
+The conversation filter row is hidden until Find is chosen in the session menu. Its input and
+Done button have phone-sized targets. Closing the filter **drops the needle**; a fresh pane also
+closes it, so a hidden filter cannot silently remove turns from a different conversation.
 
 The list carries **`overscroll-behavior: contain`**, for the same reason `.term-content` does: at
 the top of it a downward drag chained to the document and handed Chrome its pull-to-refresh, which
@@ -981,7 +1010,7 @@ appeared for the people on a tunnel.
   gate, there is no second check per message. With it on, `respond` takes free text there (it
   becomes a command), and `focus` walks instead of calling `agent focus`.
 - **`get_history` reads the agent's own transcript, not the terminal.** Request:
-  `{pane_id, limit?, before?, include_tools?}` — `limit` defaults to 200 and is capped at 2000,
+  `{pane_id, limit?, before?, include_tools?, request_id?}` — `limit` defaults to 200 and is capped at 2000,
   `before` is a turn `uuid` from an earlier response (page towards older), `include_tools` defaults
   to false. Response: `{messages, total, has_more, title, agent, file_truncated, unavailable}`,
   where each message is `{uuid, role, text, ts, truncated}` and `role` ∈
@@ -1048,7 +1077,7 @@ appeared for the people on a tunnel.
 
 ### Transcript reader (`relay/transcript.py`)
 
-Claude's JSONL is the only format understood; adding a harness is a locate+parse pair plus one line
+Claude and Pi JSONL are understood; adding a harness is a locate+parse pair plus one line
 in `HARNESSES`. Live-measured on the 196 transcripts on this machine (327MB, largest file 33.4MB):
 
 - **Found by uuid, not by deriving the path.** `glob(<root>/*/<uuid>.jsonl)` measured 0.7ms. The

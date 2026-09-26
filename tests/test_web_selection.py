@@ -164,6 +164,8 @@ class WebMirrorSelectionTests(unittest.TestCase, _Selecting):
           handleMessage(s);
           ws = {readyState: 1, send: p => window.__sent.push(JSON.parse(p))};
           window.__sent = [];
+          sessionViewChoices.set('wB:pH', 'terminal');
+          sessionViewChoices.set('wB:pQ', 'terminal');
           openTerminal('wB:pH');
           // The real interval would fire mid-test and answer for the tick under measurement.
           clearInterval(refreshInterval);
@@ -254,6 +256,8 @@ class WebPaneSwitchTests(unittest.TestCase, _Selecting):
           handleMessage(s);
           window.__sent = [];
           ws = {readyState: 1, send: p => window.__sent.push(JSON.parse(p))};
+          sessionViewChoices.set('wB:pH', 'terminal');
+          sessionViewChoices.set('wB:pQ', 'terminal');
           openTerminal('wB:pH');
           clearInterval(refreshInterval);
           handleMessage({type: 'pane_content', pane_id: 'wB:pH',
@@ -310,9 +314,9 @@ class WebPaneSwitchTests(unittest.TestCase, _Selecting):
         """Only the output being thrown away is this function's business. Not the session title,
         which openTerminal rewrites on its own and which therefore cannot hold a range across a
         switch either way -- the app header can, and is the one the reader would have copied from."""
-        self.select(".header h1", "herdr")
+        self.select("#terminalModeBtn", "Terminal")
         self.page.evaluate("openTerminal('wB:pQ')")
-        self.assertEqual(self.selected(), "herdr")
+        self.assertEqual(self.selected(), "Terminal")
 
     def test_reopening_the_pane_already_open_does_not_blank_it(self):
         """openTerminal is re-entered on every `blocked` event for the pane in front of you. Clearing
@@ -391,6 +395,8 @@ class WebSelectionCollapseTests(unittest.TestCase):
         cls.page.evaluate("""s => {
           handleMessage(s);
           ws = {readyState: 1, send: () => {}};
+          sessionViewChoices.set('wB:pH', 'terminal');
+          sessionViewChoices.set('wB:pQ', 'terminal');
           openTerminal('wB:pH');
           clearInterval(refreshInterval);
         }""", SNAPSHOT)
@@ -445,6 +451,8 @@ class WebMirrorPatchTests(unittest.TestCase, _Selecting):
         cls.page.evaluate("""s => {
           handleMessage(s);
           ws = {readyState: 1, send: () => {}};
+          sessionViewChoices.set('wB:pH', 'terminal');
+          sessionViewChoices.set('wB:pQ', 'terminal');
           openTerminal('wB:pH');
           clearInterval(refreshInterval);
         }""", SNAPSHOT)

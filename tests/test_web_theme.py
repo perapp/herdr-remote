@@ -96,7 +96,8 @@ class WebThemeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # A dark OS, because Auto on a dark OS is what most readers of this app get.
-        cls.page = _shared["browser"].new_page(viewport=PHONE, color_scheme="dark")
+        # Contrast measures the settled palette, not an intermediate animated theme transition.
+        cls.page = _shared["browser"].new_page(viewport=PHONE, color_scheme="dark", reduced_motion="reduce")
         cls.page.goto(PAGE)
 
     @classmethod

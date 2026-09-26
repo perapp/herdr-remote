@@ -57,6 +57,34 @@ For direct access over a trusted LAN:
 This binds the relay to port 8001, enables non-agent shell panes, stores a persistent access token
 in `~/.config/herdr-remote/run-token`, and prints the access URL plus a QR code for your phone.
 
+### Reading on a phone
+
+Pi and Claude panes open in **Conversation** on phone-sized screens: readable messages, compact
+links with Copy, and tool calls with expandable edit diffs. **Terminal** is always one tap away
+for the raw live pane; shell panes and other agents open there by default.
+
+Conversation checks the saved transcript periodically; it is not token-by-token streaming.
+Scrolling back, filtering, or selecting text pauses live updates. **Latest** returns to the newest
+messages and resumes following. If a transcript is unavailable, the view explains why and offers
+Retry or Open terminal. Approvals and the message composer remain accessible in either view.
+
+Use **＋** beside the composer for commands, quick actions, and terminal keys. The message field
+expands as you type; Enter sends and Shift+Enter adds a line. The **⋯** menu contains Find,
+Refresh/latest, the tool-call toggle, Settings, and Timeline.
+
+### Discovering Pi commands
+
+The Commands palette can list the **extensions, prompt templates, and skills actually loaded by
+Pi**, including custom commands such as `/git-mode` and `/write-mode`. Install the companion bridge
+on the Pi host using [these instructions](pi-extension/README.md), then run `/reload` once in each
+existing Pi session. New sessions load it automatically.
+
+The bridge publishes only command names/descriptions in a private session-sidecar file; it does
+not execute commands or read extension source. The relay reads that catalog only for the requested
+pane. Built-in shortcuts remain a labelled fallback because Pi does not include them in its
+runtime API. Other agents and SSH-hosted panes can use **Commands → Saved shortcuts**, stored per
+agent type in this browser. Discovery failure never removes your saved shortcuts.
+
 ### Windows
 
 With Git, [uv](https://docs.astral.sh/uv/), and `herdr` installed:

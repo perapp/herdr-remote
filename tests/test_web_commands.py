@@ -30,6 +30,7 @@ class CommandPaletteTests(unittest.TestCase):
         self.page.goto(PAGE)
         self.page.evaluate("""() => {
           localStorage.removeItem(COMMAND_SHORTCUTS_KEY);
+          localStorage.removeItem(COMMAND_FAVORITES_KEY);
           agents = [{pane_id:'pi',agent:'pi'}, {pane_id:'other',agent:'claude'}];
           activePane = 'pi'; window.sent = [];
           ws = {readyState:1, send: raw => sent.push(JSON.parse(raw))};
@@ -123,12 +124,136 @@ class CommandPaletteTests(unittest.TestCase):
         self.assertIn('Use /command', self.page.locator('#cmdShortcutStatus').inner_text())
         self.assertIn('/valid', self.page.evaluate('JSON.stringify(savedCommandShortcuts())'))
 
+    def heart(self, command):
+        return self.page.get_by_role('button', name=f'Favorite {command}', exact=True)
+
+    def names(self):
+        return self.page.locator('#cmdList .cmd-name').all_text_contents()
+
+    def test_hearts_toggle_and_sort_without_executing_commands(self):
+        self.reply()
+        original = self.names()
+        self.assertEqual(self.heart('/write-mode').inner_text(), '🤍')
+        self.heart('/write-mode').click()
+        self.assertEqual(self.heart('/write-mode').get_attribute('aria-pressed'), 'true')
+        self.assertEqual(self.heart('/write-mode').inner_text(), '❤️')
+        self.assertEqual(self.names(), ['/write-mode'] + [c for c in original if c != '/write-mode'])
+        self.heart('/git-mode').click()
+        self.assertEqual(self.names()[:2], ['/git-mode', '/write-mode'])
+        self.heart('/write-mode').click()
+        self.assertEqual(self.heart('/write-mode').get_attribute('aria-pressed'), 'false')
+        self.assertEqual(self.names(), ['/git-mode'] + [c for c in original if c != '/git-mode'])
+        self.assertFalse(self.page.evaluate("sent.some(m => m.type === 'send_text' || m.type === 'send_keys')"))
+        self.assertTrue(self.page.locator('#cmdPalette').is_visible())
+        self.assertEqual(self.page.locator('#cmdList button button').count(), 0)
+
+    def test_favorites_survive_page_reload(self):
+        self.heart('/model').click()
+        self.page.reload()
+        self.page.evaluate("""() => {
+          agents = [{pane_id:'pi',agent:'pi'}]; activePane = 'pi';
+          window.sent = []; ws = {readyState:1,send: raw => sent.push(JSON.parse(raw))};
+          openCommandPalette();
+        }""")
+        self.assertEqual(self.names()[0], '/model')
+        self.assertEqual(self.heart('/model').get_attribute('aria-pressed'), 'true')
+
+    def test_favorites_are_shared_between_panes_but_scoped_to_agent_type(self):
+        self.heart('/model').click()
+        self.page.evaluate("hidePalette(); activePane='other'; openCommandPalette()")
+        self.assertEqual(self.heart('/model').get_attribute('aria-pressed'), 'false')
+        self.heart('/clear').click()
+        self.page.evaluate("""hidePalette(); agents.push({pane_id:'second-pi',agent:'pi'});
+          activePane='second-pi'; openCommandPalette()""")
+        self.assertEqual(self.names()[0], '/model')
+        stored = self.page.evaluate('JSON.parse(localStorage.getItem(COMMAND_FAVORITES_KEY))')
+        self.assertEqual(stored, {'pi':['/model'], 'claude':['/clear']})
+
+    def test_search_only_command_becomes_visible_in_quick_list_when_favorited(self):
+        self.page.fill('#cmdSearch', '/reload')
+        self.heart('/reload').click()
+        self.page.fill('#cmdSearch', '')
+        self.assertEqual(self.names()[0], '/reload')
+        self.heart('/reload').click()
+        self.assertNotIn('/reload', self.names())
+        self.assertTrue(self.page.locator('#cmdSearch').evaluate('e => e === document.activeElement'))
+
+    def test_search_respects_favorite_order_but_does_not_show_nonmatches(self):
+        self.reply()
+        self.heart('/write-mode').click()
+        self.page.fill('#cmdSearch', 'mode')
+        self.assertEqual(self.names(), ['/write-mode', '/model', '/git-mode'])
+        self.page.fill('#cmdSearch', 'git')
+        self.assertEqual(self.names(), ['/git-mode'])
+
+    def test_unavailable_runtime_favorites_are_remembered_but_not_offered(self):
+        self.reply()
+        self.heart('/write-mode').click()
+        self.page.evaluate('hidePalette(); openCommandPalette()')
+        self.reply(commands=[], unavailable='no-catalog')
+        self.assertNotIn('/write-mode', self.names())
+        self.assertTrue(self.page.evaluate("savedCommandFavorites().has('/write-mode')"))
+        self.page.evaluate('hidePalette(); openCommandPalette()')
+        self.reply()
+        self.assertEqual(self.names()[0], '/write-mode')
+
+    def test_keyboard_toggle_keeps_focus_on_heart_and_never_runs_command(self):
+        self.reply()
+        self.heart('/write-mode').focus()
+        self.page.keyboard.press('Space')
+        self.assertTrue(self.heart('/write-mode').evaluate('e => e === document.activeElement'))
+        self.assertEqual(self.heart('/write-mode').get_attribute('aria-pressed'), 'true')
+        self.page.keyboard.press('Enter')
+        self.assertTrue(self.heart('/write-mode').evaluate('e => e === document.activeElement'))
+        self.assertEqual(self.heart('/write-mode').get_attribute('aria-pressed'), 'false')
+        self.assertFalse(self.page.evaluate("sent.some(m => m.type === 'send_text' || m.type === 'send_keys')"))
+
+    def test_storage_failure_does_not_pretend_to_save(self):
+        self.page.evaluate("""() => {
+          const original = Storage.prototype.setItem;
+          Storage.prototype.setItem = function(key, value) {
+            if (key === COMMAND_FAVORITES_KEY) throw new DOMException('Full', 'QuotaExceededError');
+            return original.call(this, key, value);
+          };
+        }""")
+        original = self.names()
+        self.heart('/model').click()
+        self.assertEqual(self.names(), original)
+        self.assertEqual(self.heart('/model').get_attribute('aria-pressed'), 'false')
+        self.assertIn('Could not save', self.page.locator('#cmdFavoriteStatus').inner_text())
+
+    def test_corrupt_favorites_recover_and_untrusted_values_are_ignored(self):
+        for corrupt in ('not json', 'null', '[]', '{"pi":42}'):
+            self.page.evaluate('value => localStorage.setItem(COMMAND_FAVORITES_KEY, value)', corrupt)
+            self.page.evaluate('filterCommands()')
+            self.assertEqual(self.names()[0], '/compact')
+            self.heart('/model').click()
+            self.assertEqual(self.names()[0], '/model')
+        self.page.evaluate("""localStorage.setItem(COMMAND_FAVORITES_KEY,
+          JSON.stringify({pi:[null,42,['/compact'],'/bad\\n','/model','/model','<img src=x>']}));
+          filterCommands()""")
+        self.assertEqual(self.page.evaluate('[...savedCommandFavorites()]'), ['/model'])
+        self.assertEqual(self.page.locator('#cmdList img').count(), 0)
+
+    def test_favorites_work_offline_and_do_not_replace_shortcuts(self):
+        self.page.evaluate("""localStorage.setItem(COMMAND_SHORTCUTS_KEY,
+          JSON.stringify({pi:[{cmd:'/mine',desc:'My shortcut'}]})); ws.readyState=3; filterCommands()""")
+        self.heart('/mine').click()
+        self.assertEqual(self.names()[0], '/mine')
+        self.assertIn('/mine', self.page.evaluate('localStorage.getItem(COMMAND_SHORTCUTS_KEY)'))
+        self.assertFalse(self.page.evaluate("sent.some(m => m.type === 'send_text' || m.type === 'send_keys')"))
+
     def test_phone_dialog_has_no_horizontal_overflow(self):
         self.reply()
         for width in (320, 390, 600):
             self.page.set_viewport_size({'width':width, 'height':640})
             self.assertFalse(self.page.locator('.cmd-panel').evaluate('e => e.scrollWidth > e.clientWidth'))
             self.assertGreaterEqual(self.page.locator('.cmd-item').first.bounding_box()['height'], 44)
+            heart = self.heart('/git-mode').bounding_box()
+            command = self.page.locator('.cmd-item').filter(has_text='/git-mode').bounding_box()
+            self.assertGreaterEqual(heart['width'], 44)
+            self.assertGreaterEqual(heart['height'], 44)
+            self.assertGreaterEqual(heart['x'], command['x'] + command['width'])
 
 
 if __name__ == '__main__':

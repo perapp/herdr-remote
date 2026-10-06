@@ -235,6 +235,7 @@ document.addEventListener('DOMContentLoaded', () => bind());
     </div>
     <input id="cmdSearch" type="search" aria-label="Search commands" placeholder="Search commands…" autocomplete="off" autocorrect="off" oninput="filterCommands()" />
     <p id="cmdStatus" role="status"></p>
+    <p id="cmdFavoriteStatus" role="status">Favorites are saved per agent in this browser.</p>
     <div class="cmd-scroll">
       <div id="cmdList"></div>
       <details id="cmdShortcutEditor">

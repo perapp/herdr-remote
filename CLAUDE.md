@@ -184,7 +184,7 @@ child, not an overlay: the approval dock and composer remain accessible. Both mo
 session header and a labelled switch; the global header is hidden while a phone session is open.
 
 The Commands palette requests `get_commands` on open rather than guessing custom commands from
-files. `pi-extension/commands.ts` publishes `pi.getCommands()` into a private, bounded sidecar next
+files. `pi-extension/commands.ts` publishes `pi.getCommands()` into a private, bounded sidecar
 beside the allocated session JSONL path, even before a fresh session saves its first message.
 `relay/command_catalog.py` reads only the validated server-side session ref, with containment,
 regular-file, size, schema and freshness checks. Command discovery must not depend on the transcript
@@ -193,6 +193,13 @@ DOM text and buttons, not interpolated HTML/onclick strings. Built-ins are label
 user-configured shortcuts are browser-local and agent-scoped. Runtime entries override duplicate
 fallbacks. Correlation rejects replies for a different pane/request/connection. SSH catalogs are
 currently explicitly unavailable, not scanned or guessed. See `pi-extension/README.md`.
+
+Command hearts are independent sibling buttons with `aria-pressed`, never nested in command
+execution buttons. Favorites use `herdr_command_favorites_v1` in localStorage, mapping agent types
+to command-name arrays. Sorting is stable with favorites first; favorited search-only built-ins
+also appear in the quick list. Preferences never invent unavailable commands or execute them.
+Storage failures leave the rendered state unchanged and show an explicit message. Focus follows
+the heart after reordering, or returns to search if removing a favorite hides that command.
 
 The conversation status describes reading state, not network activity: routine polls leave its
 text and text node unchanged. Initial loading, paused reading, offline and errors still update it.

@@ -87,6 +87,12 @@ pane. Built-in shortcuts remain a labelled fallback because Pi does not include 
 runtime API. Other agents and SSH-hosted panes can use **Commands → Saved shortcuts**, stored per
 agent type in this browser. Discovery failure never removes your saved shortcuts.
 
+Tap the heart beside a command to favorite it: **🤍 → ❤️**. Favorites appear first, including
+commands normally found only through search. Hearts never execute commands. Favorites are saved
+per agent type in this browser's local storage, shared across its panes, and survive page reloads.
+They do not sync between devices or different site addresses. An unavailable command keeps its
+favorite preference but is only offered again when discovery or a saved shortcut provides it.
+
 ### Windows
 
 With Git, [uv](https://docs.astral.sh/uv/), and `herdr` installed:

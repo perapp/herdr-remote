@@ -45,6 +45,8 @@ const COMMANDS = {
 // Loaded commands come from the agent, never from evaluating its extension files in the relay.
 // Saved shortcuts are explicitly user-authored fallbacks and remain available offline.
 const COMMAND_SHORTCUTS_KEY = 'herdr_command_shortcuts_v1';
+const COMMAND_FAVORITES_KEY = 'herdr_command_favorites_v1';
+const COMMAND_FAVORITES_LIMIT = 1000;
 const COMMAND_NAME = /^\/[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$/;
 let commandSerial = 0, commandRequest = null, commandCatalog = [], commandPane = null;
 let commandAgent = '', commandSocket = null;
@@ -65,6 +67,44 @@ function savedCommandShortcuts(agent = commandAgentKey()) {
     return all[agent].filter(c => c && typeof c.cmd === 'string' && COMMAND_NAME.test(c.cmd) && typeof c.desc === 'string')
       .slice(0, 100).map(c => ({cmd: c.cmd, desc: c.desc.slice(0, 200), common: true, source: 'shortcut'}));
   } catch (e) { return []; }
+}
+
+function savedCommandFavorites(agent = commandAgentKey()) {
+  try {
+    const all = JSON.parse(localStorage.getItem(COMMAND_FAVORITES_KEY) || '{}');
+    const names = all?.[agent];
+    if (!Array.isArray(names)) return new Set();
+    return new Set(names.filter(cmd => typeof cmd === 'string' && COMMAND_NAME.exec(cmd)?.[0] === cmd)
+      .slice(0, COMMAND_FAVORITES_LIMIT));
+  } catch (e) { return new Set(); }
+}
+
+function toggleCommandFavorite(cmd) {
+  if (!commandAgent || commandPane !== activePane || commandAgent !== commandAgentKey()
+      || typeof cmd !== 'string' || COMMAND_NAME.exec(cmd)?.[0] !== cmd) return;
+  const status = document.getElementById('cmdFavoriteStatus');
+  const favorites = savedCommandFavorites(commandAgent);
+  const adding = !favorites.has(cmd);
+  if (adding && favorites.size >= COMMAND_FAVORITES_LIMIT) {
+    status.textContent = `You can save up to ${COMMAND_FAVORITES_LIMIT} favorites per agent.`; return;
+  }
+  if (adding) favorites.add(cmd);
+  else favorites.delete(cmd);
+  try {
+    let all;
+    try { all = JSON.parse(localStorage.getItem(COMMAND_FAVORITES_KEY) || '{}'); } catch (e) { all = {}; }
+    if (!all || typeof all !== 'object' || Array.isArray(all)) all = {};
+    Object.defineProperty(all, commandAgent, {value: [...favorites], enumerable: true, configurable: true});
+    localStorage.setItem(COMMAND_FAVORITES_KEY, JSON.stringify(all));
+  } catch (e) {
+    status.textContent = 'Could not save favorites in this browser. Nothing changed.'; return;
+  }
+  status.textContent = `${cmd} ${adding ? 'added to' : 'removed from'} favorites. Saved in this browser.`;
+  filterCommands();
+  // Reordering replaces the buttons: keep keyboard focus on the heart, not the command.
+  const heart = [...document.querySelectorAll('#cmdList .cmd-favorite')]
+    .find(button => button.dataset.command === cmd);
+  (heart || document.getElementById('cmdSearch')).focus();
 }
 
 function getAgentCommands() {
@@ -144,6 +184,7 @@ function openCommandPalette() {
   document.getElementById('cmdShortcutLabel').textContent = `Shortcuts for ${commandAgent || 'this agent'} in this browser`;
   document.getElementById('cmdShortcuts').value = savedCommandShortcuts().map(c => `${c.cmd} | ${c.desc}`).join('\n');
   document.getElementById('cmdShortcutStatus').textContent = '';
+  document.getElementById('cmdFavoriteStatus').textContent = 'Favorites are saved per agent in this browser.';
   filterCommands();
   requestAgentCommands();
   document.getElementById('cmdSearch').focus();
@@ -184,8 +225,11 @@ function saveCommandShortcuts() {
 function filterCommands() {
   const q = document.getElementById('cmdSearch').value.trim().toLowerCase();
   const cmds = getAgentCommands();
+  const favorites = savedCommandFavorites();
   const filtered = q ? cmds.filter(c => c.cmd.toLowerCase().includes(q) || c.desc.toLowerCase().includes(q))
-    : cmds.filter(c => c.common);
+    : cmds.filter(c => c.common || favorites.has(c.cmd));
+  // Stable within each group; unavailable commands are never resurrected from preferences.
+  filtered.sort((a, b) => Number(favorites.has(b.cmd)) - Number(favorites.has(a.cmd)));
   const el = document.getElementById('cmdList');
   el.replaceChildren();
   if (!filtered.length) {
@@ -194,6 +238,7 @@ function filterCommands() {
     el.appendChild(empty); return;
   }
   for (const c of filtered) {
+    const row = document.createElement('div'); row.className = 'cmd-row';
     const button = document.createElement('button');
     button.type = 'button'; button.className = 'cmd-item';
     if (c.danger) button.classList.add('danger');
@@ -201,9 +246,23 @@ function filterCommands() {
     const desc = document.createElement('span'); desc.className = 'cmd-desc'; desc.textContent = c.desc;
     const source = document.createElement('span'); source.className = 'cmd-source'; source.textContent = c.source;
     button.append(name, desc, source);
-    const pane = activePane;
+    const pane = activePane, agent = commandAgent;
     button.addEventListener('click', () => { if (activePane === pane) runCommand(c.cmd); });
-    el.appendChild(button);
+    // Sibling buttons, never a button inside another button: a heart cannot run the command.
+    const heart = document.createElement('button');
+    const favorite = favorites.has(c.cmd);
+    heart.type = 'button'; heart.className = 'cmd-favorite'; heart.dataset.command = c.cmd;
+    heart.setAttribute('aria-label', `Favorite ${c.cmd}`);
+    heart.setAttribute('aria-pressed', String(favorite));
+    heart.title = `${favorite ? 'Remove' : 'Add'} ${c.cmd} ${favorite ? 'from' : 'to'} favorites`;
+    const icon = document.createElement('span'); icon.setAttribute('aria-hidden', 'true');
+    icon.textContent = favorite ? '❤️' : '🤍';
+    heart.appendChild(icon);
+    heart.addEventListener('click', () => {
+      if (activePane === pane && commandAgent === agent) toggleCommandFavorite(c.cmd);
+    });
+    row.append(button, heart);
+    el.appendChild(row);
   }
 }
 

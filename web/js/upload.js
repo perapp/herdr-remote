@@ -227,6 +227,7 @@ function insertAtCaret(text) {
   input.value = before + lead + word + trail + after;
   const caret = (before + lead + word + trail).length;
   input.setSelectionRange(caret, caret);
+  resizeComposer();
 }
 
 // A paste of plain text is left to the browser; only one that actually queued files is taken.

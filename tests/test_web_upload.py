@@ -246,6 +246,11 @@ class WebUploadTests(_UploadPage, unittest.TestCase):
         self.drive()
         self.assertEqual(self.box(), "see " + PATH + " ")
 
+    def test_inserted_paths_resize_the_composer(self):
+        before = self.page.locator("#termInput").bounding_box()["height"]
+        self.page.evaluate("() => insertAtCaret('/uploads/' + 'long-name-'.repeat(30) + '.png')")
+        self.assertGreater(self.page.locator("#termInput").bounding_box()["height"], before)
+
     def test_the_path_is_spaced_from_the_text_around_it(self):
         self.type_into_box("see this")
         self.page.evaluate("() => document.getElementById('termInput').setSelectionRange(3, 3)")
@@ -270,7 +275,7 @@ class WebUploadTests(_UploadPage, unittest.TestCase):
         self.assertEqual(self.page.get_attribute("#termInput", "placeholder"), "Uploading 2 of 2…")
         self.drive(path="/u/two.png")
         self.assertIsNone(self.page.get_attribute("#attachBtn", "aria-busy"))
-        self.assertEqual(self.page.get_attribute("#termInput", "placeholder"), "Type…")
+        self.assertEqual(self.page.get_attribute("#termInput", "placeholder"), "Message…")
         self.assertEqual(self.box(), PATH + " /u/two.png ")
 
     def test_a_refusal_shows_and_keeps_the_typed_text(self):
@@ -552,7 +557,10 @@ class _RowMeasure(_UploadPage):
                  .map(b => b.getAttribute('aria-label') || b.textContent.trim())""")
 
     def test_the_input_row_stays_short_with_the_button(self):
-        self.assertLess(self.row_height(), 47)
+        # The fork's multiline composer uses 44px touch targets plus 8px padding
+        # on each side and a 1px border; uploading must not grow the idle row.
+        self.assertLessEqual(self.row_height(), 61)
+        self.assertGreaterEqual(self.page.locator("#termInput").bounding_box()["height"], 44)
 
     def test_no_button_in_the_row_is_clipped(self):
         self.assertEqual(self.clipped(), [])

@@ -1191,6 +1191,7 @@ function restoreUnsentText(msg){
   if(!lastSent||lastSent.pane_id!==msg.pane_id||activePane!==msg.pane_id)return;
   const i=document.getElementById('termInput');
   if(!i.value)i.value=lastSent.text;
+  resizeComposer();
   lastSent=null;
   showSendError(/detected question/.test(msg.message||'')
     ? 'The agent is showing a menu this app cannot read. Answer it with the keys, then send again.'

@@ -245,6 +245,16 @@ class WebUndeliveredTextTests(unittest.TestCase):
         self.assertEqual(self.box(), "Como essa trava vai se resolver?")
         self.assertIn("text was not delivered", self.notice())
 
+    def test_a_restored_multiline_message_resizes_the_composer(self):
+        self.open_pane("idle")
+        text = "first\nsecond\nthird"
+        self.type_and_send(text)
+        empty_height = self.page.locator("#termInput").bounding_box()["height"]
+        self.page.evaluate("() => __msg(0, {type: 'error', message: 'text was not delivered',"
+                           " scope: 'send_text', pane_id: 'w1:p1'})")
+        self.assertEqual(self.box(), text)
+        self.assertGreater(self.page.locator("#termInput").bounding_box()["height"], empty_height)
+
     def test_a_refused_answer_to_an_unreadable_menu_comes_back_with_a_reason(self):
         self.open_pane("blocked")
         self.type_and_send("pode derrubar")

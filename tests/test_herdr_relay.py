@@ -2010,7 +2010,8 @@ class RelayCommandTests(unittest.TestCase):
             })])
 
             with mock.patch.object(relay, "send_current_snapshot", new=mock.AsyncMock()), \
-                 mock.patch.object(relay, "run_herdr") as run, \
+                 mock.patch.object(relay, "run_herdr_result", return_value=subprocess.CompletedProcess(
+                     [], 0, stdout="", stderr="")) as run, \
                  mock.patch.object(relay.log, "info") as log_info, \
                  mock.patch.object(relay, "audit") as audit:
                 asyncio.run(relay.handle_client(ws))
@@ -3594,7 +3595,7 @@ class RelayPaneFieldTests(unittest.TestCase):
         self.assertTrue(command[-1].startswith("sh -c "))
 
 
-class RelayTerminalTitleTests(unittest.TestCase):
+class RelayMobileTerminalTitleTests(unittest.TestCase):
     """The title is live activity or it is the harness saying its own name -- never a session."""
 
     def test_a_working_agents_activity_survives_and_the_banner_does_not(self):

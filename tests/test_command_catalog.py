@@ -209,7 +209,9 @@ class CommandHandlerTests(unittest.TestCase):
             def reader(session, **kwargs):
                 self.assertNotEqual(thread, threading.get_ident())
                 self.assertEqual(session["value"], "/server/session")
-                self.assertEqual(kwargs, {"remote": None, "agent": "pi"})
+                self.assertEqual(kwargs, {"remote": None, "agent": "pi",
+                                          "ssh_runner": relay.transcript_ssh,
+                                          "ssh_args": relay.SSH_BASE_ARGS})
                 return {"commands": []}
 
             with mock.patch.object(relay.command_catalog, "commands", side_effect=reader):

@@ -174,7 +174,7 @@ function workspaceRows() {
     // can legitimately show up here holding no agents at all.
     return spaces.workspaces.map(w => ({
       key: spaceKey(w.host, w.workspace_id), id: w.workspace_id, host: w.host || 'local',
-      name: w.label || w.workspace_id, number: w.number || 0,
+      name: (w.label || w.workspace_id) + (w.source_label ? ` @${w.source_label}` : ''), number: w.number || 0,
       focused: !!w.focused, paneCount: w.pane_count || 0,
     })).sort((a, b) => a.number - b.number);
   }
@@ -186,7 +186,8 @@ function workspaceRows() {
     const key = agentWorkspaceKey(a);
     if (!seen.has(key)) {
       seen.set(key, {key, id: a.workspace_id, host: a.host || 'local',
-                     name: a.project || a.workspace_id, number: 0, focused: false, paneCount: 0});
+                     name: (a.project || a.workspace_id) + (a.source_label ? ` @${a.source_label}` : ''),
+                     number: 0, focused: false, paneCount: 0});
     }
   }
   return [...seen.values()];

@@ -93,6 +93,18 @@ class AgentStateTests(unittest.TestCase):
 
         self.assertEqual([agent["pane_id"] for agent in result], ["w1:p1", "w2:p1", "w3:p1"])
 
+    def test_machine_event_preserves_source_identity_and_display_label(self):
+        pane_id = "r0123456789abcdef:w1:p1"
+        message = complete_agent_update_message(
+            {"pane_id": pane_id, "status": "blocked"},
+            current={**self.snapshot[0], "pane_id": pane_id,
+                     "host": "machine:abc", "source_label": "perd25"},
+        )
+        result = apply_agent_message([*self.snapshot, message["agent"]], message)
+        self.assertEqual(result[0]["status"], "working")
+        self.assertEqual(result[-1]["host"], "machine:abc")
+        self.assertEqual(result[-1]["source_label"], "perd25")
+
     def test_complete_snapshot_replaces_and_removes_agents(self):
         replacement = [{"pane_id": "w2:p1", "agent": "pi", "status": "working"}]
         result = apply_agent_message(self.snapshot, {"type": "agents", "agents": replacement})

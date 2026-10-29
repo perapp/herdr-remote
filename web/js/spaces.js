@@ -307,7 +307,8 @@ function renderSessionSelector() {
   const total = sources.reduce((n, s) => n + s.sessions.length, 0);
   // Nothing to switch between: stay out of the way. Hide the wrapper, not just
   // the button, or the header's flex gap leaves a stray space behind.
-  if (total < 2) { picker.style.display = 'none'; menu.style.display = 'none'; return; }
+  const hasFixedSource = sources.some(s => s.switchable === false);
+  if (total < 2 && !hasFixedSource) { picker.style.display = 'none'; menu.style.display = 'none'; return; }
   picker.style.display = '';
 
   const multiSource = sources.length > 1;
@@ -324,23 +325,25 @@ function renderSessionSelector() {
     // mismatch (e.g. herdr's default session not literally named
     // "default") degrades to a correct-but-unticked label rather than a
     // confidently wrong one.
-    btn.textContent = (entry ? entry.name : local.active) + ' ▾';
+    const name = entry ? entry.name : local.active;
+    btn.textContent = (local.switchable === false ? `${local.label || local.host} · ${name}` : name) + ' ▾';
   }
 
   const rowTargets = [];
   menu.innerHTML = sources.map(src => {
     const header = multiSource
-      ? `<div class="chip-label" style="padding:4px 8px">${escapeHtml(src.host)}</div>`
+      ? `<div class="chip-label" style="padding:4px 8px">${escapeHtml(src.label || src.host)}</div>`
       : '';
     const rows = src.sessions.map(s => {
       const active = (src.active || 'default') === s.name;
       const dim = s.running ? '' : 'opacity:0.55;';
-      rowTargets.push({ host: src.host, session: s.name });
+      const fixed = src.switchable === false;
+      rowTargets.push({ host: src.host, session: s.name, fixed });
       // The tick lives in a fixed-width span so ticked and unticked names
       // start at the same x. A bare space would collapse in HTML.
-      return `<div role="option" aria-selected="${active}" tabindex="0" style="${dim}"`
+      return `<div role="option" aria-selected="${active}" aria-disabled="${fixed}" tabindex="${fixed ? -1 : 0}" style="${dim}"`
            + `><span class="session-mark">${active ? '✓' : ''}</span>`
-           + `${escapeHtml(s.name)}${s.running ? '' : ' ·'}</div>`;
+           + `${escapeHtml(s.name)}${fixed ? ' · configured in Herdr' : s.running ? '' : ' ·'}</div>`;
     }).join('');
     return header + rows;
   }).join('');
@@ -352,6 +355,7 @@ function renderSessionSelector() {
   menu.querySelectorAll('[role="option"]').forEach((row, i) => {
     row.dataset.host = rowTargets[i].host;
     row.dataset.session = rowTargets[i].session;
+    if (rowTargets[i].fixed) return;
     const activate = () => switchHerdrSession(row.dataset.host, row.dataset.session);
     row.addEventListener('click', activate);
     row.addEventListener('keydown', (event) => {
@@ -373,6 +377,7 @@ function toggleSessionMenu() {
 let switchingSession = false;
 
 function switchHerdrSession(host, session) {
+  if (sessionState?.sources?.some(s => s.host === host && s.switchable === false)) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   document.getElementById('sessionMenu').style.display = 'none';
   document.getElementById('sessionSelector').setAttribute('aria-expanded', 'false');

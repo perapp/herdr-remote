@@ -87,7 +87,7 @@ def loaded_relay(*, herdr_bin=None, relay_host=None, relay_token=None, trusted_o
     original_websockets_level = websockets_logger.level
 
     with tempfile.TemporaryDirectory() as log_dir:
-        environment = {"HERDR_LOG_DIR": log_dir}
+        environment = {"HERDR_LOG_DIR": log_dir, "HERDR_MACHINES": "off"}
         if herdr_bin is not None:
             environment["HERDR_BIN"] = herdr_bin
         if relay_host is not None:
@@ -2430,7 +2430,7 @@ class RelaySubprocessConcurrencyTests(unittest.TestCase):
         regression -- everything still works, the relay just stops answering anyone else while it
         runs -- so it has to be caught here rather than in review.
         """
-        seeds = {"subprocess.run", "subprocess.check_output", "time.sleep",
+        seeds = {"subprocess.run", "subprocess.check_output", "time.sleep", "ThreadPoolExecutor",
                  "zc.unregister_service"}
         tree = ast.parse(RELAY_PATH.read_text(encoding="utf-8"), str(RELAY_PATH))
 
@@ -2875,7 +2875,7 @@ class RelayUploadConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             release = threading.Event()
             loop = asyncio.get_running_loop()
 
-            def slow_store(spool_path, pane_id, name):
+            def slow_store(spool_path, pane_id, name, expected_binding=None):
                 nonlocal live, peak
                 live += 1
                 peak = max(peak, live)
@@ -3089,7 +3089,8 @@ class RelayUploadSweepTests(unittest.TestCase):
              mock.patch.object(relay, "get_agent_names", return_value={}):
             with mock.patch.object(relay, "run_herdr", return_value=listing):
                 relay.list_panes_from_host(remote="user@box")
-            expected = {"w1:p1": "id:abc", "w1:p2": None, "w1:p3": None}
+            expected = {relay.bind_source_id("user@box", pane): ref
+                        for pane, ref in {"w1:p1": "id:abc", "w1:p2": None, "w1:p3": None}.items()}
             self.assertEqual(relay.live_upload_refs("user@box"), expected)
             self.assertEqual(relay.live_upload_refs("local"), {})
             with mock.patch.object(relay, "run_herdr", return_value=""):

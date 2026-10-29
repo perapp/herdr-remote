@@ -136,3 +136,23 @@ polls, including everything in `HERDR_REMOTES`.
   pane id, the path and the size.
 - Set `HERDR_UPLOADS=0` to switch the capability off. The relay then sends no `upload_max_bytes`,
   the web app shows no attach button, and the relay refuses every `upload_start`.
+
+## Registered machine scope
+
+Enabled profiles from `herdr machine list --json` are included automatically, even when they
+are not the machine currently selected in Herdr. Set `HERDR_MACHINES=off` to keep a relay
+limited to local panes and explicit `HERDR_REMOTES`. Review saved profiles before exposing
+the relay: relay access includes terminal control on every monitored enabled machine, and
+with shell panes enabled it includes shell command execution there.
+
+Native Herdr commands use the saved profile ID and its configured session. Client-supplied
+machine names, SSH destinations, session paths, and arbitrary native pane IDs are not trusted
+routing instructions. Remote pane identifiers distinguish sources and sessions. Profile changes
+invalidate old routing rather than falling back to the local machine.
+
+Transcript reads, command-catalog reads, and uploads use auxiliary noninteractive SSH to the
+profile's configured target; Herdr's native API bridge is not a file-transfer API. The relay
+uses existing SSH credentials and does not store passwords. Remote Pi reads require Python 3,
+canonicalize paths under allowed session roots, bound their reads, and do not execute extension
+source. A client requests a pane, not a filesystem path. A machine without working auxiliary
+SSH can still expose its API-backed pane controls while file features remain unavailable.

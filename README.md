@@ -61,6 +61,34 @@ in `~/.config/herdr-remote/run-token`, and prints the access URL plus a QR code 
 It prefers a private address on a physical LAN interface over VPN/tunnel addresses. Set
 `HERDR_LAN_IP` to override the advertised address when more than one LAN interface is active.
 
+### Registered Herdr machines
+
+Enabled machines saved with `herdr machine` are discovered automatically by the relay and
+by the desktop clients in direct mode. For example, after registering `perd25` in Herdr,
+restart the client/relay (or wait for discovery to refresh); no `HERDR_REMOTES` entry is needed.
+The machine does not have to be Herdr's currently selected machine.
+
+- Pane, workspace, tab, approval, and terminal commands use `herdr --machine <profile-id>`.
+  Each profile uses its configured Herdr session. Change that session with Herdr's machine
+  configuration, not the dashboard's session picker.
+- Local panes and legacy `HERDR_REMOTES` SSH hosts continue to work alongside machines.
+  Avoid listing the same endpoint/session both ways unless you want two separate views.
+- Pane identifiers are qualified by source/session so identical IDs on different machines
+  cannot redirect replies. Machine labels are display names, not routing identifiers.
+- SSH authentication stays with Herdr/OpenSSH; the dashboard never collects SSH passwords.
+  Run the relay under a user with access to the relevant SSH configuration and credentials.
+- History, Pi command catalogs, and uploads use a separate noninteractive SSH connection to
+  the profile's target. They can be unavailable even when Herdr's API connection works.
+  Remote Pi history/catalog reads require `python3` and the Pi command bridge installed on
+  that machine; the bridge is not installed remotely by the relay.
+- Set `HERDR_MACHINES=off` to disable automatic machine discovery. Older Herdr versions
+  without machine discovery continue to support local panes and explicit SSH targets.
+
+Machine support requires a Herdr version with `machine list --json` and `--machine` API
+routing (tested with Herdr 0.9.5). An unreachable machine does not grant permission to run its
+commands locally or against a different session. Removing/disabling a profile makes its old
+pane controls unavailable; profile routing changes require freshly discovered panes.
+
 ### Reading on a phone
 
 Pi and Claude panes open in **Conversation** on phone-sized screens: readable messages, compact
@@ -86,8 +114,8 @@ existing Pi session. New sessions load it automatically.
 The bridge publishes only command names/descriptions in a private session-sidecar file; it does
 not execute commands or read extension source. The relay reads that catalog only for the requested
 pane. Built-in shortcuts remain a labelled fallback because Pi does not include them in its
-runtime API. Other agents and SSH-hosted panes can use **Commands → Saved shortcuts**, stored per
-agent type in this browser. Discovery failure never removes your saved shortcuts.
+runtime API. Other agents or panes without a reachable command catalog can use **Commands → Saved shortcuts**,
+stored per agent type in this browser. Discovery failure never removes your saved shortcuts.
 
 Tap the heart beside a command to favorite it: **🤍 → ❤️**. Favorites appear first, including
 commands normally found only through search. Hearts never execute commands. Favorites are saved
@@ -184,8 +212,11 @@ Codex history is located by session UUID under `$CODEX_HOME/sessions` (default
 Set `HERDR_CODEX_ROOTS` to override the local session roots (comma-separated).
 For Codex panes on an SSH host, set `HERDR_REMOTE_CODEX_ROOTS` when the remote
 sessions are not under `$HOME/.codex/sessions`; the relay's local `CODEX_HOME`
-is not used on the remote host. Only Claude and Codex currently support SSH
-transcript reads. `HERDR_TRANSCRIPT=0` disables history for every agent.
+is not used on the remote host. Claude, Codex, and Pi support SSH transcript reads.
+Pi uses the remote `~/.pi/agent/sessions` directory by default; set `HERDR_REMOTE_PI_ROOTS`
+to override its allowed roots (comma-separated). Remote Pi reads are bounded, require
+`python3`, and reject paths outside those roots. Kimi remote history is not currently supported.
+`HERDR_TRANSCRIPT=0` disables history for every agent.
 
 ## Architecture
 

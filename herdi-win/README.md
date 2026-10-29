@@ -335,6 +335,23 @@ process on the machine can read, so it is not ported. Host list lives in plainte
 one is normal** — Windows is usually the machine watching, not the one running agents, so
 the local host is simply skipped instead of raising the hard error the mac app does.
 
+### Registered Herdr machines
+
+With a local Herdr supporting `machine list --json` and `--machine`, direct mode also
+polls every enabled registered profile, independently of Herdr's selected machine.
+No SSH-host setting is needed for these profiles. Set `HERDR_MACHINES=off` to opt out.
+Local panes and configured SSH hosts remain supported; SSH-only use does not require
+a local Herdr binary.
+
+Machine commands run through the local binary as `herdr --machine <profile-id> …`,
+without a session override: the profile owns its session. Pane identities include the
+profile ID, target and session, while labels are display-only. Each machine action
+revalidates that binding; removal, disabling, routing changes or discovery failure
+fail closed, never falling back to local execution. Discovery refreshes each poll;
+a failed discovery removes machine rows until a successful refresh. Native raw pane
+IDs are retained separately; relay pane IDs are always returned unchanged.
+Relay `source_label` metadata is used for display with the relay label as fallback.
+
 ## Deliberate differences from herdi-mac
 
 **A pane view instead of "Jump to terminal".** On macOS a row tap shells out to

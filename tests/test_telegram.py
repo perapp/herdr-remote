@@ -250,6 +250,22 @@ class TelegramDashboardTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(set(labels)), 2)
         self.assertTrue(all(len(label) <= 64 for label in labels))
 
+    def test_machine_labels_and_collision_safe_callback_routing(self):
+        tg.agents = [
+            {**make_agents(1)[0], "pane_id": "w1:p1"},
+            {**make_agents(1)[0], "pane_id": "r0123456789abcdef:w1:p1",
+             "host": "machine:abc", "source_label": "perd25"},
+        ]
+        labels = tg.agent_button_labels(tg.agents)
+        self.assertIn("perd25", labels[1])
+        self.assertNotIn("machine:abc", labels[1])
+        local = tg.pane_callback_data("read", tg.agents[0]["pane_id"])
+        remote = tg.pane_callback_data("read", tg.agents[1]["pane_id"])
+        self.assertNotEqual(local, remote)
+        self.assertEqual(tg.parse_callback_data(local)["pane_id"], "w1:p1")
+        self.assertEqual(tg.parse_callback_data(remote)["pane_id"], "r0123456789abcdef:w1:p1")
+        self.assertLessEqual(len(remote.encode()), 64)
+
     def test_all_pane_callbacks_fit_telegram_byte_limit(self):
         pane_id = "pane-" + "кирилица" * 100
         tg.agents = make_agents(1)

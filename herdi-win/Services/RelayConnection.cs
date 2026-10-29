@@ -204,7 +204,9 @@ public sealed class RelayConnection : INotifyPropertyChanged, IDisposable
     private void ApplySourceVisibility()
     {
         var show = _sockets.Count > 1;
-        foreach (var agent in Agents) agent.ShowSource = show;
+        foreach (var agent in Agents) agent.ShowSource = show ||
+            !string.Equals(agent.SourceLabel, _sockets.FirstOrDefault(s => s.Url == agent.SourceId)?.Label,
+                StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -347,7 +349,7 @@ public sealed class RelayConnection : INotifyPropertyChanged, IDisposable
             var agent = Agents[i];
             if (!string.Equals(agent.SourceId, sourceId, StringComparison.Ordinal)) continue;
             if (seen.Contains(agent.Id)) continue;
-            if (hostsCovered is not null && !hostsCovered.Contains(agent.Host)) continue;
+            if (hostsCovered is not null && !hostsCovered.Contains(agent.Route?.Key ?? agent.Host)) continue;
             Agents.RemoveAt(i);
         }
 
@@ -369,7 +371,8 @@ public sealed class RelayConnection : INotifyPropertyChanged, IDisposable
             existing.Project = data.Project;
             existing.Cwd = data.Cwd;
             existing.Host = data.Host ?? "local";
-            existing.SourceLabel = sourceLabel;
+            existing.SourceLabel = data.SourceLabel ?? sourceLabel;
+            existing.ShowSource = _sockets.Count > 1 || !string.IsNullOrEmpty(data.SourceLabel);
             // Answered from another client: drop the prompt and retract the toast.
             if (wasBlocked && status != AgentStatus.Blocked)
             {
@@ -398,9 +401,11 @@ public sealed class RelayConnection : INotifyPropertyChanged, IDisposable
             data.Cwd,
             data.Host ?? "local",
             sourceId,
-            sourceLabel)
+            data.SourceLabel ?? sourceLabel)
         {
-            ShowSource = _sockets.Count > 1,
+            RawPaneId = data.RawPaneId,
+            Route = data.Route,
+            ShowSource = _sockets.Count > 1 || !string.IsNullOrEmpty(data.SourceLabel),
         };
         Agents.Add(agent);
         return agent;
@@ -420,6 +425,14 @@ public sealed class RelayConnection : INotifyPropertyChanged, IDisposable
 
         IsConnected = result.Reachable;
         LastError = result.Error;
+        if (result.ActiveRoutes is not null)
+        {
+            for (var i = Agents.Count - 1; i >= 0; i--)
+            {
+                if (Agents[i].Route is { } route && !result.ActiveRoutes.Contains(route.Key))
+                    Agents.RemoveAt(i);
+            }
+        }
 
         // Direct mode is one source by construction — the poller has already merged every
         // configured host into this one result — so it needs no label of its own.
@@ -435,7 +448,7 @@ public sealed class RelayConnection : INotifyPropertyChanged, IDisposable
         {
             // Reading takes an SSH round trip, in which the prompt may have been answered
             // from the terminal itself.
-            if (agent.Status != AgentStatus.Blocked) return;
+            if (agent.Status != AgentStatus.Blocked || !Agents.Contains(agent)) return;
             agent.Prompt = prompt;
             agent.Options = options;
             AgentBlocked?.Invoke(agent);
@@ -446,6 +459,26 @@ public sealed class RelayConnection : INotifyPropertyChanged, IDisposable
     {
         var content = await _direct.ReadPaneAsync(agent, lines);
         _post(() => PaneContentReceived?.Invoke(agent.Id, content));
+    }
+
+    private bool CanAct(Agent agent)
+    {
+        if (Agents.Contains(agent) && (Mode != ConnectionMode.Direct ||
+            (agent.SourceId == Agent.DirectSource && agent.Route is not null && agent.RawPaneId is not null))) return true;
+        LastError = "pane source changed or is no longer available — refresh the pane list";
+        return false;
+    }
+
+    private async Task RespondDirectAsync(Agent agent, string text)
+    {
+        var result = await _direct.RespondAsync(agent, text);
+        _post(() =>
+        {
+            if (!result.Ok) { LastError = result.Error; return; }
+            if (!Agents.Contains(agent)) return;
+            agent.Status = AgentStatus.Working;
+            agent.ClearPrompt();
+        });
     }
 
     /// <summary>Surface a failed direct-mode command the same way a socket error surfaces.</summary>
@@ -485,11 +518,12 @@ public sealed class RelayConnection : INotifyPropertyChanged, IDisposable
     /// </summary>
     public void Respond(Agent agent, string text)
     {
-        if (string.IsNullOrWhiteSpace(text)) return;
+        if (!CanAct(agent) || string.IsNullOrWhiteSpace(text)) return;
 
         if (Mode == ConnectionMode.Direct)
         {
-            _ = ReportAsync(_direct.RespondAsync(agent, text.Trim()));
+            _ = RespondDirectAsync(agent, text.Trim());
+            return;
         }
         else
         {
@@ -511,6 +545,7 @@ public sealed class RelayConnection : INotifyPropertyChanged, IDisposable
     /// </summary>
     public void SendPrompt(Agent agent, string text)
     {
+        if (!CanAct(agent)) return;
         var trimmed = text.Trim();
         if (trimmed.Length == 0) return;
         if (trimmed.Length > Protocol.MaxPromptLength) trimmed = trimmed[..Protocol.MaxPromptLength];
@@ -522,12 +557,14 @@ public sealed class RelayConnection : INotifyPropertyChanged, IDisposable
     /// <summary>Send ^C to the pane. The relay's key allowlist spells this "C-c".</summary>
     public void Interrupt(Agent agent)
     {
+        if (!CanAct(agent)) return;
         if (Mode == ConnectionMode.Direct) _ = ReportAsync(_direct.InterruptAsync(agent));
         else Send(agent, Protocol.SendKeys(agent.PaneId, Protocol.InterruptKey));
     }
 
     public void ReadPane(Agent agent, int lines = 30)
     {
+        if (!CanAct(agent)) return;
         if (Mode == ConnectionMode.Direct) _ = ReadPaneDirectAsync(agent, lines);
         else Send(agent, Protocol.ReadPane(agent.PaneId, lines));
     }

@@ -57,6 +57,7 @@ struct AgentMessage: Decodable {
         let cwd: String
         let project: String
         let host: String?
+        let source_label: String?
     }
 
     private enum CodingKeys: String, CodingKey {

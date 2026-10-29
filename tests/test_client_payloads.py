@@ -225,14 +225,15 @@ class ClientPayloadTests(unittest.TestCase):
     def test_windows_direct_mode_namespaces_remote_pane_ids(self):
         """Two hosts can hand out the same pane id, so ids carry their host in direct mode.
 
-        The prefix is a client-side namespace and must be stripped again before the id goes
-        back to the host that issued it.
+        The UI namespace remains opaque; native commands use the separately retained raw
+        pane ID and route rather than reverse-parsing a prefix.
         """
         poller = (ROOT / "herdi-win" / "Services" / "HerdrPoller.cs").read_text(
             encoding="utf-8"
         )
-        self.assertIn('host + ":" + paneId', poller)
-        self.assertIn("StartsWith(prefix", poller)
+        self.assertIn("Agent.ComposeId(route.Key, paneId)", poller)
+        self.assertIn("agent.RawPaneId", poller)
+        self.assertIn("agent.Route", poller)
         # Interrupt keeps the one spelling the relay proved the CLI accepts.
         self.assertIn("Protocol.InterruptKey", poller)
 
@@ -251,7 +252,7 @@ class ClientPayloadTests(unittest.TestCase):
         )
         self.assertIn("HostsAnswered", poller)
         self.assertIn("result.Agents, result.HostsAnswered", connection)
-        self.assertIn("hostsCovered.Contains(agent.Host)", connection)
+        self.assertIn("hostsCovered.Contains(agent.Route?.Key ?? agent.Host)", connection)
 
     def test_windows_every_expanded_row_opens_something(self):
         """A row that swallows a click is why the expanded island read as inert.

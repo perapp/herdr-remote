@@ -86,10 +86,16 @@ Unavailable replies have an empty `commands` list and `unavailable` set to
 Request errors use `type: "error"`, `scope: "get_commands"`, and valid correlation
 fields. Session paths and process IDs never cross this WebSocket interface.
 
-**SSH panes are deliberately unavailable (`remote`).** No remote command discovery
-or static source scanning is attempted. The browser retains built-in commands and
-browser-configured saved shortcuts when runtime discovery is unavailable. A relay
-running locally on the remote machine can read that machine's catalogs normally.
+**SSH and registered-machine panes can read catalogs remotely.** Install this bridge on
+the Pi host, not just the relay host. The relay uses noninteractive SSH and remote Python 3
+to read the exact sidecar under the remote allowed Pi roots (`HERDR_REMOTE_PI_ROOTS`,
+default `~/.pi/agent/sessions`). It does not install the bridge, scan extension source, or
+execute remote extension code. The same size, schema, session-identity, and freshness
+limits apply; synchronize the hosts' clocks. An absent allocated transcript is allowed,
+but its parent must exist and remain inside an approved root. Missing SSH/Python/catalog
+support leaves runtime discovery unavailable, with built-in commands and browser-configured
+saved shortcuts retained. The low-level reader without an injected SSH transport still
+returns `remote`.
 
 Discovery is metadata, not an execution guarantee: commands may change after a
 refresh, and commands opening terminal dialogs still need interaction with Pi.

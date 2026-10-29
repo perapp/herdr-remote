@@ -275,8 +275,7 @@ class CodexHistoryTests(unittest.TestCase):
                 transcript.remote_probe_script(value, roots, 0, 4096, harness="codex")
 
     def test_harnesses_without_remote_locators_do_not_probe_another_harness_tree(self):
-        for agent, kind, value in (("pi", "path", "/tmp/session.jsonl"),
-                                   ("kimi", "id", f"session_{SESSION}")):
+        for agent, kind, value in (("kimi", "id", f"session_{SESSION}"),):
             with self.subTest(agent=agent):
                 runner = mock.Mock()
                 body = transcript.history({"agent": agent, "kind": kind, "value": value},

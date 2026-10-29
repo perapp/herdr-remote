@@ -31,6 +31,9 @@ class AgentCard(Static):
         name = self.agent.get("agent", "?")
         label = self.agent.get("label", "") or self.agent.get("project", "")
         yield Label(f"[{color}]●[/] {label}/{name} [{color}]{status}[/]", markup=True)
+        host = self.agent.get("host", "local")
+        if host != "local":
+            yield Label("@" + (self.agent.get("source_label") or host), markup=False)
 
 
 class AgentColumn(Vertical):

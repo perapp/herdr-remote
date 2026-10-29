@@ -109,7 +109,7 @@ function secondaryOf(p, scope) {
 
 function hostHtml(p) {
   return p.host && p.host !== 'local'
-    ? `<span class="pane-host" style="color:var(--orange);font-size:0.6rem">@${escapeHtml(p.host)}</span>` : '';
+    ? `<span class="pane-host" style="color:var(--orange);font-size:0.6rem">@${escapeHtml(p.source_label || p.host)}</span>` : '';
 }
 
 function agentCard(a, scope) {

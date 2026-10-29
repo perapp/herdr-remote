@@ -336,7 +336,7 @@ def agent_button_labels(agent_list: list[dict]) -> list[str]:
         status = STATUS_LABELS.get(agent.get("status", "unknown"), "UNKNOWN")
         project = agent.get("project") or agent.get("cwd") or "unknown"
         name = agent.get("agent") or "agent"
-        host = agent.get("host", "local")
+        host = agent.get("source_label") or agent.get("host", "local")
         bases.append(f"[{status}] {project} ({name})")
         contexts.append(f" @{compact_identifier(host, 24)}" if host != "local" else "")
 
@@ -451,22 +451,22 @@ async def cmd_agents(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if blocked:
         lines.append("BLOCKED:")
         for a in blocked:
-            host = f" @{a['host']}" if a.get('host', 'local') != 'local' else ''
+            host = f" @{a.get('source_label') or a['host']}" if a.get('host', 'local') != 'local' else ''
             lines.append(f"  {a['project']} ({a['agent']}){host}")
     if working:
         lines.append("WORKING:")
         for a in working:
-            host = f" @{a['host']}" if a.get('host', 'local') != 'local' else ''
+            host = f" @{a.get('source_label') or a['host']}" if a.get('host', 'local') != 'local' else ''
             lines.append(f"  {a['project']} ({a['agent']}){host}")
     if done:
         lines.append("DONE:")
         for a in done:
-            host = f" @{a['host']}" if a.get('host', 'local') != 'local' else ''
+            host = f" @{a.get('source_label') or a['host']}" if a.get('host', 'local') != 'local' else ''
             lines.append(f"  {a['project']} ({a['agent']}){host}")
     if idle:
         lines.append("IDLE:")
         for a in idle:
-            host = f" @{a['host']}" if a.get('host', 'local') != 'local' else ''
+            host = f" @{a.get('source_label') or a['host']}" if a.get('host', 'local') != 'local' else ''
             lines.append(f"  {a['project']} ({a['agent']}){host}")
 
     await update.message.reply_text("\n".join(lines))

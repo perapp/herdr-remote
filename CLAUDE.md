@@ -15,7 +15,7 @@ Clients (web/mac/ios/telegram/tui)
    relay (:8375)  ←── Cloudflare tunnel (public wss://)
         │
         ▼
-   herdr CLI (local or SSH to HERDR_REMOTES)
+   herdr CLI (local, --machine profiles, or SSH to HERDR_REMOTES)
 ```
 
 The relay (`relay/herdr_relay.py`) is the central hub: it polls herdr for agent state, accepts push events via HTTP POST and UDP, and broadcasts to connected WebSocket clients. Clients send `respond`, `read_pane`, `send_keys`, and `send_text` messages back through the relay to control agents.
@@ -94,7 +94,9 @@ cd herdi-win && ./build.ps1
 |----------|---------|
 | `HERDR_RELAY_PORT` | Relay WebSocket port (default: 8375) |
 | `HERDR_RELAY_TOKEN` | Optional shared secret for auth |
-| `HERDR_REMOTES` | Comma-separated SSH targets to poll |
+| `HERDR_REMOTES` | Comma-separated legacy SSH targets to poll |
+| `HERDR_MACHINES` | Discover enabled registered machine profiles automatically; `off` disables discovery |
+| `HERDR_REMOTE_PI_ROOTS` | Comma-separated allowed remote Pi session roots (default `~/.pi/agent/sessions`) |
 | `HERDR_SSH_CONTROL_PATH` | Override the SSH multiplexing control socket (default `<log dir>/ssh-%C`; skipped on Windows, or when the path would exceed the AF_UNIX limit) |
 | `HERDR_BIN` | Path to herdr binary (default: `/opt/homebrew/bin/herdr`) |
 | `HERDR_RELAY` | Relay URL used by clients (default: `ws://127.0.0.1:8375`) |
@@ -732,6 +734,37 @@ distinct `cwd` basenames, so eight of them are indistinguishable from a sibling 
 2.5ms locally but it is **one call per pane**, which is one SSH round trip per pane, so it never
 enters the poll. `read_pane` takes an optional `process: true` and answers with
 `process: {name, cmdline}`; a client asks when it *opens* a pane, not on every mirror refresh.
+
+### Registered machine sources and pane identity
+
+Enabled saved Herdr machine profiles are discovered with `herdr machine list --json`.
+`HERDR_MACHINES=off` disables discovery. Profile selection in Herdr does not limit discovery.
+Machine API commands use the local Herdr executable with `--machine <profile-id>` and
+must not add `--session`: Herdr uses the profile's saved session. Legacy SSH sources remain
+separate, even when they happen to name the same physical target.
+
+A machine's logical source key is stable across display-label changes. The source's label is
+presentation metadata (`source_label` on pane/space records, `label` on session sources),
+never an SSH destination supplied by a client. `sessions.sources` adds `kind`, `label`, and
+`switchable`; registered-machine sessions are informational (`switchable: false`). The
+server rejects session switches for those sources, including a switch to `null`.
+
+Clients must treat `pane_id` as opaque. Nonlocal panes are qualified by source and session;
+two machines may both return the same native ID, such as `w1:p1`. Never strip a prefix in a
+relay-connected client. Only the relay resolves an accepted current binding back to the
+native pane ID and source. Command translation applies to identifier positions, never to
+arbitrary message text. Profile/session routing changes invalidate old controls. Workspace
+and tab IDs continue to use the existing separate `host` field for routing.
+
+Filesystem features still use auxiliary SSH to the profile's target, not `--machine`.
+Logical source keys scope caches and uploads; the physical SSH target is resolved only
+inside transport code. A failed or removed source is not proof that its conversations
+ended and must not authorize upload deletion on a different profile target.
+
+Remote Pi history and command catalogs use a bounded Python 3 helper with canonical root
+containment. An allocated transcript may be absent for command discovery, but its real
+parent must exist inside an allowed remote Pi root. The bridge itself must be installed on
+the Pi host; discovery neither reads extension source nor installs anything remotely.
 
 ### The relay is single-threaded; every herdr call is not
 

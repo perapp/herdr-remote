@@ -14,7 +14,8 @@ namespace Herdi.Services;
 /// <param name="Reachable">True when at least one host answered.</param>
 /// <param name="Error">Why hosts failed, or null when all of them answered.</param>
 public sealed record PollResult(
-    List<AgentData> Agents, HashSet<string> HostsAnswered, bool Reachable, string? Error);
+    List<AgentData> Agents, HashSet<string> HostsAnswered, bool Reachable, string? Error,
+    HashSet<string>? ActiveRoutes = null);
 
 /// <summary>
 /// Polls `herdr pane list` on the local machine and over SSH, so agent state can be read
@@ -134,15 +135,19 @@ public sealed partial class HerdrPoller : IDisposable
     private async Task<PollResult> PollOnceAsync(CancellationToken token)
     {
         // Null stands for the local host, exactly as the relay's remote=None does.
-        var hosts = new List<string?>();
-        if (_cli.LocalBinary is not null) hosts.Add(null);
-        foreach (var remote in _settings.Remotes) hosts.Add(remote);
+        var hosts = new List<DirectRoute>();
+        if (_cli.LocalBinary is not null) hosts.Add(DirectRoute.Local);
+        foreach (var remote in _settings.Remotes) hosts.Add(DirectRoute.Ssh(remote));
+        string? discoveryError = null;
+        try { hosts.AddRange(await _cli.DiscoverMachinesAsync(token)); }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) { discoveryError = "machine discovery: " + ex.Message; }
 
         if (hosts.Count == 0)
         {
             return new PollResult(
                 new List<AgentData>(), new HashSet<string>(), false,
-                "no herdr binary and no SSH hosts — add one in Settings");
+                "no herdr binary and no SSH hosts — add one in Settings", new HashSet<string>());
         }
 
         // Hosts run concurrently: each has its own gate in HerdrCli, and one unreachable
@@ -150,8 +155,9 @@ public sealed partial class HerdrPoller : IDisposable
         var polls = await Task.WhenAll(hosts.Select(host => PollHostAsync(host, token)));
 
         var agents = new List<AgentData>();
-        var answered = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var answered = new HashSet<string>(StringComparer.Ordinal);
         var failures = new List<string>();
+        if (discoveryError is not null) failures.Add(discoveryError);
         foreach (var (host, panes, error) in polls)
         {
             if (error is not null)
@@ -167,26 +173,28 @@ public sealed partial class HerdrPoller : IDisposable
             agents,
             answered,
             answered.Count > 0,
-            failures.Count == 0 ? null : string.Join("; ", failures));
+            failures.Count == 0 ? null : string.Join("; ", failures),
+            hosts.Select(h => h.Key).ToHashSet(StringComparer.Ordinal));
     }
 
     private async Task<(string Host, List<AgentData> Panes, string? Error)> PollHostAsync(
-        string? host, CancellationToken token)
+        DirectRoute host, CancellationToken token)
     {
-        var label = host ?? "local";
-        var result = await _cli.RunAsync(host, PaneListArgs, token);
+        var result = await _cli.RunRouteAsync(host, PaneListArgs, token);
         return result.Ok
-            ? (label, ParsePanes(result.Output, label), null)
-            : (label, new List<AgentData>(), result.Error ?? "unreachable");
+            ? (host.Key, ParsePanes(result.Output, host), null)
+            : (host.Key, new List<AgentData>(), result.Error ?? "unreachable");
     }
 
     /// <summary>
-    /// Parse `herdr pane list` output. Same projection as the relay's
-    /// get_agents_from_host (herdr_relay.py:226), except remote pane ids are prefixed with
-    /// their host: unlike the relay, nothing here keeps a pane-to-host side table, so the
-    /// id has to carry the host or two machines' panes could collide under one id.
+    /// Parse `herdr pane list` into route-qualified identities while retaining the raw
+    /// pane id and immutable route separately. Display labels never determine execution.
     /// </summary>
-    internal static List<AgentData> ParsePanes(string json, string host)
+    internal static List<AgentData> ParsePanes(string json, string host) =>
+        ParsePanes(json, string.Equals(host, "local", StringComparison.OrdinalIgnoreCase)
+            ? DirectRoute.Local : DirectRoute.Ssh(host));
+
+    internal static List<AgentData> ParsePanes(string json, DirectRoute route)
     {
         var agents = new List<AgentData>();
         if (string.IsNullOrWhiteSpace(json)) return agents;
@@ -202,7 +210,6 @@ public sealed partial class HerdrPoller : IDisposable
                 return agents;
             }
 
-            var remote = !string.Equals(host, "local", StringComparison.OrdinalIgnoreCase);
             foreach (var pane in panes.EnumerateArray())
             {
                 var name = AgentData.Str(pane, "agent");
@@ -211,12 +218,15 @@ public sealed partial class HerdrPoller : IDisposable
 
                 var cwd = AgentData.Str(pane, "cwd") ?? string.Empty;
                 agents.Add(new AgentData(
-                    remote ? host + ":" + paneId : paneId,
+                    Agent.ComposeId(route.Key, paneId),
                     name,
                     AgentData.Str(pane, "agent_status") ?? "unknown",
                     cwd,
                     ProjectName(cwd),
-                    host));
+                    route.DisplayLabel,
+                    route.DisplayLabel,
+                    paneId,
+                    route));
             }
         }
         catch (JsonException)
@@ -262,11 +272,11 @@ public sealed partial class HerdrPoller : IDisposable
     public async Task<string> ReadPaneAsync(
         Agent agent, int lines, string source = "recent", CancellationToken token = default)
     {
-        var result = await _cli.RunAsync(
-            HostOf(agent),
+        var result = await _cli.RunRouteAsync(
+            agent.Route,
             new[] { "pane", "read", PaneIdOf(agent), "--lines", lines.ToString(), "--source", source },
             token);
-        return result.Ok ? result.Output : string.Empty;
+        return result.Ok ? result.Output : "Pane unavailable: " + result.Error;
     }
 
     /// <summary>
@@ -276,12 +286,12 @@ public sealed partial class HerdrPoller : IDisposable
     /// </summary>
     public async Task<HerdrResult> RespondAsync(Agent agent, string text, CancellationToken token = default)
     {
-        var host = HostOf(agent);
+        var host = agent.Route;
         var paneId = PaneIdOf(agent);
 
-        var sent = await _cli.RunAsync(host, new[] { "pane", "send-text", paneId, text }, token);
+        var sent = await _cli.RunRouteAsync(host, new[] { "pane", "send-text", paneId, text }, token);
         if (!sent.Ok) return sent;
-        return await _cli.RunAsync(host, new[] { "pane", "send-keys", paneId, "Enter" }, token);
+        return await _cli.RunRouteAsync(host, new[] { "pane", "send-keys", paneId, "Enter" }, token);
     }
 
     /// <summary>
@@ -291,8 +301,8 @@ public sealed partial class HerdrPoller : IDisposable
     /// submission; typing into the pane and pressing Enter does not always land.
     /// </summary>
     public Task<HerdrResult> PromptAsync(Agent agent, string text, CancellationToken token = default) =>
-        _cli.RunAsync(
-            HostOf(agent),
+        _cli.RunRouteAsync(
+            agent.Route,
             new[] { "agent", "prompt", PaneIdOf(agent), text },
             token);
 
@@ -302,28 +312,15 @@ public sealed partial class HerdrPoller : IDisposable
     /// across both modes.
     /// </summary>
     public Task<HerdrResult> InterruptAsync(Agent agent, CancellationToken token = default) =>
-        _cli.RunAsync(
-            HostOf(agent),
+        _cli.RunRouteAsync(
+            agent.Route,
             new[] { "pane", "send-keys", PaneIdOf(agent), Protocol.InterruptKey },
             token);
 
-    /// <summary>Null for a local agent, else the SSH target to run the command on.</summary>
-    private static string? HostOf(Agent agent) => agent.IsRemote ? agent.Host : null;
-
-    /// <summary>
-    /// The pane id as its own host knows it, with the host prefix removed. Matched against
-    /// the exact host rather than cut at the first colon — herdr pane ids contain colons
-    /// themselves, so the mac app's "drop up to the first colon" truncates local ids.
-    ///
-    /// Reads Agent.PaneId, not Agent.Id: Id gained a source prefix when the client learned
-    /// to watch several relays at once, and PaneId is the half a CLI argument wants.
-    /// </summary>
+    /// <summary>The unmodified CLI id. Never reverse-parse a UI or relay identifier.</summary>
     private static string PaneIdOf(Agent agent)
     {
-        var prefix = agent.Host + ":";
-        return agent.IsRemote && agent.PaneId.StartsWith(prefix, StringComparison.Ordinal)
-            ? agent.PaneId[prefix.Length..]
-            : agent.PaneId;
+        return agent.RawPaneId ?? throw new InvalidOperationException("raw pane id unavailable");
     }
 
     /// <summary>Port of detect_options (herdr_relay.py:281), including its TOOL_OPTIONS fallback.</summary>

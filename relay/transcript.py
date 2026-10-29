@@ -86,6 +86,7 @@ KIMI_ROOTS = _roots_env("HERDR_KIMI_ROOTS", [os.path.expanduser("~/.kimi-code/se
 # Remote roots stay unexpanded: they are shell words for the remote host, whose $HOME is not ours.
 REMOTE_ROOTS = _roots_env("HERDR_REMOTE_CLAUDE_ROOTS", ["$HOME/.claude/projects"])
 REMOTE_CODEX_ROOTS = _roots_env("HERDR_REMOTE_CODEX_ROOTS", ["$HOME/.codex/sessions"])
+REMOTE_PI_ROOTS = _roots_env("HERDR_REMOTE_PI_ROOTS", ["~/.pi/agent/sessions"])
 MAX_BYTES = _int_env("HERDR_TRANSCRIPT_MAX_BYTES", 64 * 1024 * 1024)
 TAIL_BYTES = _int_env("HERDR_TRANSCRIPT_TAIL_BYTES", 8 * 1024 * 1024)
 # Remote is stingier than local: the bytes cross a network, and the biggest transcript on this
@@ -845,6 +846,113 @@ def remote_probe_script(session_value, roots, expected_size, tail_bytes, harness
     )
 
 
+class RemotePiUnavailable(Exception):
+    """An explicit remote Pi capability or path failure (never fall back to local IO)."""
+
+
+# Executed only on the Pi host. No shell expansion of roots or session paths, directory
+# harvesting, third-party imports, or writes. The final open is nonblocking/no-follow and
+# checked against lstat so a special file or replacement cannot hang the SSH worker.
+_REMOTE_PI_HELPER = r'''
+import json, os, stat, sys
+
+request = json.loads(sys.argv[1])
+
+def emit(frame):
+    print(frame, flush=True)
+
+def contained(path, roots):
+    return any(os.path.commonpath([path, root]) == root for root in roots)
+
+def read_file(path, limit, tail=False, expected=0):
+    before = os.lstat(path)
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError("not regular")
+    if not tail and before.st_size > limit:
+        raise ValueError("too large")
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as handle:
+        opened = os.fstat(handle.fileno())
+        if (not stat.S_ISREG(opened.st_mode)
+                or (before.st_dev, before.st_ino) != (opened.st_dev, opened.st_ino)
+                or os.path.realpath(path, strict=True) != path):
+            raise ValueError("file changed")
+        size = opened.st_size
+        if tail:
+            if expected > 0 and size == expected:
+                return "CACHED", b""
+            handle.seek(max(0, size - limit))
+            return "SIZE " + str(size), handle.read(min(size, limit))
+        blob = handle.read(limit + 1)
+        if len(blob) > limit:
+            raise ValueError("too large")
+        return "CATALOG", blob
+
+try:
+    path = request["path"]
+    if (not isinstance(path, str) or not os.path.isabs(path) or "\x00" in path
+            or not path.endswith(".jsonl")
+            or any(part in (".", "..") for part in path.split("/"))):
+        emit("NOSESSION")
+        sys.exit(0)
+    roots = [os.path.realpath(os.path.expanduser(os.path.expandvars(root)))
+             for root in request["roots"]]
+    try:
+        parent = os.path.realpath(os.path.dirname(path), strict=True)
+    except OSError:
+        emit("NOSESSION")
+        sys.exit(0)
+    if not os.path.isdir(parent) or not contained(parent, roots):
+        emit("NOSESSION")
+        sys.exit(0)
+    allocated = os.path.join(parent, os.path.basename(path))
+    try:
+        os.lstat(allocated)
+    except FileNotFoundError:
+        canonical = allocated
+    else:
+        try:
+            canonical = os.path.realpath(allocated, strict=True)
+        except OSError:
+            emit("NOSESSION")
+            sys.exit(0)
+        if (not contained(canonical, roots) or not canonical.endswith(".jsonl")
+                or not stat.S_ISREG(os.stat(canonical).st_mode)):
+            emit("NOSESSION")
+            sys.exit(0)
+    if request["mode"] == "catalog":
+        frame, blob = read_file(canonical + ".herdr-commands.json", 128 * 1024)
+        emit(frame + " " + json.dumps(canonical))
+    else:
+        frame, blob = read_file(canonical, request["limit"], True, request["expected"])
+        emit(frame)
+    sys.stdout.buffer.write(blob)
+except FileNotFoundError:
+    emit("NOFILE")
+except (OSError, ValueError, TypeError, RecursionError, OverflowError):
+    emit("ERROR")
+'''
+
+
+def remote_pi_script(value, *, mode="transcript", expected_size=0, tail_bytes=REMOTE_TAIL_BYTES):
+    """A bounded stdlib reader; all untrusted values are a quoted JSON argv word."""
+    request = {"path": value, "roots": REMOTE_PI_ROOTS, "mode": mode,
+               "expected": int(expected_size), "limit": max(1, int(tail_bytes))}
+    return "python3 -c " + shlex.quote(_REMOTE_PI_HELPER) + " " + shlex.quote(json.dumps(request))
+
+
+def check_remote_pi_frame(returncode, blob):
+    if returncode == 127:
+        raise RemotePiUnavailable("python3-unavailable")
+    if returncode != 0:
+        raise RemotePiUnavailable("remote-error")
+    header = blob.partition(b"\n")[0]
+    if header == b"NOSESSION":
+        raise RemotePiUnavailable("no-session")
+    if header == b"ERROR":
+        raise RemotePiUnavailable("error")
+
+
 def _default_remote_runner(remote, script, ssh_args=()):
     cmd = ["ssh", *ssh_args, remote, "sh -c " + shlex.quote(script)]
     proc = subprocess.run(cmd, capture_output=True, timeout=REMOTE_TIMEOUT)
@@ -1018,7 +1126,7 @@ def history(session, remote=None, limit=DEFAULT_LIMIT, before=None, include_tool
         return _unavailable("unsupported", harness)
     locate, parse = entry
     # Remote lookup needs a harness-specific path, not another harness's glob (or a raw path ref).
-    if remote and harness not in {"claude", "codex"}:
+    if remote and harness not in {"claude", "codex", "pi"}:
         return _unavailable("unsupported", harness)
 
     try:
@@ -1031,6 +1139,8 @@ def history(session, remote=None, limit=DEFAULT_LIMIT, before=None, include_tool
             parsed = _load_remote(value, parse, remote, ssh_args, remote_runner, harness=harness)
         else:
             parsed = _load_local(value, locate, parse)
+    except RemotePiUnavailable as exc:
+        return _unavailable(str(exc), harness)
     except Exception:
         if log:
             log.exception("transcript read failed for session %s (remote=%s)", value, remote)
@@ -1073,8 +1183,16 @@ def _load_remote(value, parse, remote, ssh_args, remote_runner, harness="claude"
     key = (remote, harness, value)
     roots = REMOTE_CODEX_ROOTS if harness == "codex" else REMOTE_ROOTS
     runner = remote_runner or _default_remote_runner
-    script = remote_probe_script(value, roots, cache_peek_size(key), REMOTE_TAIL_BYTES, harness=harness)
+
+    def probe(expected):
+        if harness == "pi":
+            return remote_pi_script(value, expected_size=expected, tail_bytes=REMOTE_TAIL_BYTES)
+        return remote_probe_script(value, roots, expected, REMOTE_TAIL_BYTES, harness=harness)
+
+    script = probe(cache_peek_size(key))
     returncode, blob = runner(remote, script, ssh_args)
+    if harness == "pi":
+        check_remote_pi_frame(returncode, blob)
     if returncode != 0:
         raise OSError(f"ssh transcript read failed on {remote} with exit {returncode}")
     header, _, body = blob.partition(b"\n")
@@ -1086,8 +1204,10 @@ def _load_remote(value, parse, remote, ssh_args, remote_runner, harness="claude"
         if cached is not None:
             return cached
         # The cache was evicted between the probe and now. Ask again without the shortcut.
-        script = remote_probe_script(value, roots, 0, REMOTE_TAIL_BYTES, harness=harness)
+        script = probe(0)
         returncode, blob = runner(remote, script, ssh_args)
+        if harness == "pi":
+            check_remote_pi_frame(returncode, blob)
         if returncode != 0:
             raise OSError(f"ssh transcript read failed on {remote} with exit {returncode}")
         header, _, body = blob.partition(b"\n")

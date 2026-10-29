@@ -4,6 +4,7 @@ import math
 import os
 import re
 import stat
+import subprocess
 import time
 
 try:
@@ -115,7 +116,7 @@ def _validate(data, session_file, now):
     return {"commands": result}
 
 
-def commands(session, remote=None, agent="", now=None):
+def commands(session, remote=None, agent="", now=None, *, ssh_runner=None, ssh_args=()):
     """Read only the session ref supplied by relay state, never a client path."""
     if not ENABLED:
         return unavailable("disabled")
@@ -131,7 +132,26 @@ def commands(session, remote=None, agent="", now=None):
             or not os.path.isabs(value) or "\x00" in value):
         return unavailable("no-session")
     if remote:
-        return unavailable("remote")
+        if ssh_runner is None:
+            return unavailable("remote")
+        try:
+            code, blob = ssh_runner(
+                remote, transcript.remote_pi_script(value, mode="catalog"), ssh_args)
+            transcript.check_remote_pi_frame(code, blob)
+            header, separator, body = blob.partition(b"\n")
+            if header == b"NOFILE":
+                return unavailable("no-catalog")
+            if not separator or not header.startswith(b"CATALOG ") or len(body) > MAX_BYTES:
+                return unavailable("error")
+            session_file = json.loads(header[len(b"CATALOG "):])
+            if not isinstance(session_file, str) or not session_file.endswith(".jsonl"):
+                return unavailable("error")
+            return _validate(json.loads(body), session_file, time.time() if now is None else now)
+        except transcript.RemotePiUnavailable as exc:
+            return unavailable(str(exc))
+        except (OSError, ValueError, TypeError, RecursionError, OverflowError,
+                subprocess.SubprocessError):
+            return unavailable("error")
     try:
         session_file = _allocated_session(value)
         if not session_file:

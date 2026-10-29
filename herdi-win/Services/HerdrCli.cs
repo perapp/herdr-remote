@@ -1,6 +1,9 @@
 using System.Diagnostics;
 using System.IO;
 using System.Text;
+using System.Text.Json;
+using System.Text.RegularExpressions;
+using Herdi.Models;
 
 namespace Herdi.Services;
 
@@ -106,6 +109,65 @@ public sealed class HerdrCli
         }
     }
 
+    public static bool MachinesEnabled => !new[] { "off", "0", "false", "no" }.Contains(
+        Environment.GetEnvironmentVariable("HERDR_MACHINES")?.Trim(), StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>Read the local registry, not the selected machine. Malformed discovery fails closed.</summary>
+    public async Task<List<DirectRoute>> DiscoverMachinesAsync(CancellationToken token = default)
+    {
+        if (!MachinesEnabled || LocalBinary is null) return new();
+        var result = await RunAsync(null, new[] { "machine", "list", "--json" }, token);
+        if (!result.Ok) throw new InvalidOperationException(result.Error ?? "machine discovery failed");
+        using var doc = JsonDocument.Parse(result.Output.Trim().TrimStart('\uFEFF'));
+        var machines = doc.RootElement;
+        if (machines.ValueKind == JsonValueKind.Object) machines = machines.GetProperty("machines");
+        if (machines.ValueKind != JsonValueKind.Array) throw new InvalidOperationException("invalid machine list");
+        var routes = new List<DirectRoute>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var item in machines.EnumerateArray())
+        {
+            var id = AgentData.Str(item, "id") ?? "";
+            var target = AgentData.Str(item, "target") ?? "";
+            var session = AgentData.Str(item, "session") ?? "";
+            if (item.TryGetProperty("label", out var rawLabel) &&
+                rawLabel.ValueKind is not (JsonValueKind.String or JsonValueKind.Null))
+                throw new InvalidOperationException("invalid machine label");
+            var label = AgentData.Str(item, "label");
+            if (string.IsNullOrEmpty(label)) label = id;
+            if (!Regex.IsMatch(id, @"\A[A-Za-z0-9_.-]{1,128}\z") || !seen.Add(id) ||
+                target.Length == 0 || target.StartsWith('-') || target.Any(char.IsWhiteSpace) || session.Length == 0 ||
+                !item.TryGetProperty("enabled", out var enabled) ||
+                enabled.ValueKind is not (JsonValueKind.True or JsonValueKind.False))
+                throw new InvalidOperationException("invalid machine profile");
+            if (enabled.GetBoolean()) routes.Add(new DirectRoute("machine", target, session, id, label));
+        }
+        return routes;
+    }
+
+    /// <summary>Never infer a route from a label or a pane prefix, even after discovery failure.</summary>
+    public async Task<HerdrResult> RunRouteAsync(DirectRoute? route, IReadOnlyList<string> args, CancellationToken token = default)
+    {
+        if (route is null) return HerdrResult.Fail("pane route unavailable — refresh the pane list");
+        if (route.Kind == "local")
+            return LocalBinary is null ? HerdrResult.Fail("herdr not found") : await RunAsync(null, args, token);
+        if (route.Kind == "ssh")
+            return _settings.Remotes.Contains(route.Target, StringComparer.Ordinal)
+                ? await RunAsync(route.Target, args, token)
+                : HerdrResult.Fail("SSH source is no longer configured");
+        if (route.Kind != "machine") return HerdrResult.Fail("unknown pane route");
+        try
+        {
+            var current = await DiscoverMachinesAsync(token);
+            if (!current.Any(r => r.Key == route.Key))
+                return HerdrResult.Fail("machine removed, disabled or changed — refresh the pane list");
+            var routed = new List<string> { "--machine", route.ProfileId };
+            routed.AddRange(args);
+            return await RunAsync(null, routed, token);
+        }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex) { return HerdrResult.Fail("machine discovery: " + ex.Message); }
+    }
+
     private SemaphoreSlim GateFor(string host)
     {
         lock (_hostGates)
@@ -132,6 +194,12 @@ public sealed class HerdrCli
             StandardOutputEncoding = Encoding.UTF8,
             StandardErrorEncoding = Encoding.UTF8,
         };
+        // The profile, not the desktop process's inherited pane/session, owns routing.
+        if (args.Count >= 2 && args[0] == "--machine")
+        {
+            info.Environment.Remove("HERDR_SESSION");
+            info.Environment.Remove("HERDR_SOCKET_PATH");
+        }
         // ArgumentList quotes each argument for us, which matters for send-text payloads
         // carrying spaces, quotes or newlines.
         foreach (var arg in args) info.ArgumentList.Add(arg);

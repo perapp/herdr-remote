@@ -108,7 +108,10 @@ public sealed record AgentData(
     string Status,
     string Cwd,
     string Project,
-    string? Host)
+    string? Host,
+    string? SourceLabel = null,
+    string? RawPaneId = null,
+    DirectRoute? Route = null)
 {
     public static AgentData? From(JsonElement e)
     {
@@ -121,7 +124,8 @@ public sealed record AgentData(
             Str(e, "status") ?? "unknown",
             Str(e, "cwd") ?? string.Empty,
             Str(e, "project") ?? string.Empty,
-            Str(e, "host"));
+            Str(e, "host"),
+            Str(e, "source_label"));
     }
 
     internal static string? Str(JsonElement e, string name) =>

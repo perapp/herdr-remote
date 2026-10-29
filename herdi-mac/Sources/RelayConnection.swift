@@ -87,6 +87,8 @@ final class RelayConnection {
 
     func startDirect() {
         mode = .direct
+        agents = []
+        paneRoutes = [:]
         task?.cancel(with: .normalClosure, reason: nil)
         pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -95,8 +97,77 @@ final class RelayConnection {
         pollHerdr() // immediate first poll
     }
 
+    private var polling = false
+
+    private struct DirectRoute: Equatable {
+        let kind: String
+        let target: String
+        var profileId = ""
+        var session = ""
+        var label = ""
+        var key: String {
+            let data = try! JSONSerialization.data(withJSONObject: [kind, profileId, session, target])
+            return String(data: data, encoding: .utf8)!
+        }
+        var display: String { kind == "local" ? "local" : (label.isEmpty ? target : label) }
+    }
+    private struct PaneRoute {
+        let source: DirectRoute
+        let rawPaneId: String
+    }
+    private var paneRoutes: [String: PaneRoute] = [:]
+
+    /// Selection is a CLI convenience, not an enable/disable flag.
+    private func discoverMachines() -> [DirectRoute]? {
+        let setting = ProcessInfo.processInfo.environment["HERDR_MACHINES", default: ""].lowercased()
+        if ["off", "0", "false", "no"].contains(setting) { return [] }
+        let output = runHerdr("machine", "list", "--json")
+        guard let data = output.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data),
+              let list = (json as? [[String: Any]]) ?? ((json as? [String: Any])?["machines"] as? [[String: Any]]) else { return nil }
+        var seen = Set<String>()
+        var routes: [DirectRoute] = []
+        for item in list {
+            guard let id = item["id"] as? String,
+                  id.range(of: "^[A-Za-z0-9_.-]{1,128}$", options: .regularExpression) != nil,
+                  seen.insert(id).inserted,
+                  let target = item["target"] as? String, !target.isEmpty, !target.hasPrefix("-"),
+                  !target.contains(where: { $0.isWhitespace }),
+                  let session = item["session"] as? String, !session.isEmpty,
+                  let enabled = item["enabled"] as? Bool else { return nil }
+            if let label = item["label"], !(label is String), !(label is NSNull) { return nil }
+            if enabled {
+                let label = item["label"] as? String ?? ""
+                routes.append(DirectRoute(kind: "machine", target: target, profileId: id, session: session, label: label.isEmpty ? id : label))
+            }
+        }
+        return routes
+    }
+
+    /// Each command revalidates registry routing. Discovery failure never becomes local execution.
+    private func runRoute(_ route: PaneRoute, _ args: [String]) -> String {
+        switch route.source.kind {
+        case "machine":
+            guard let machines = discoverMachines(), machines.contains(where: { $0.key == route.source.key }) else { return "" }
+            return runHerdr(arguments: ["--machine", route.source.profileId] + args)
+        case "ssh":
+            guard remotes.contains(route.source.target) else { return "" }
+            return runSSH(route.source.target, arguments: ["herdr"] + args)
+        case "local": return runHerdr(arguments: args)
+        default: return ""
+        }
+    }
+
+    private func currentRoute(_ paneId: String) -> PaneRoute? {
+        guard mode == .direct, agents.contains(where: { $0.id == paneId }) else { return nil }
+        return paneRoutes[paneId]
+    }
+
     private func pollHerdr() {
+        guard mode == .direct, !polling else { return }
+        polling = true
         DispatchQueue.global(qos: .utility).async { [self] in
+            defer { DispatchQueue.main.async { self.polling = false } }
             // Check if herdr binary is found
             if herdrPath.isEmpty {
                 DispatchQueue.main.async { [self] in
@@ -107,25 +178,29 @@ final class RelayConnection {
                 return
             }
             
-            // Local
-            var allAgents = parseAgents(from: runHerdr("pane", "list"), host: "local")
-
-            // Remotes via SSH
-            for remote in remotes {
-                let result = runSSH(remote, "herdr", "pane", "list")
-                allAgents += parseAgents(from: result, host: remote)
+            let machines = discoverMachines()
+            let sources = [DirectRoute(kind: "local", target: "")] + remotes.map { DirectRoute(kind: "ssh", target: $0) } + (machines ?? [])
+            var allAgents: [ParsedAgent] = []
+            var routes: [String: PaneRoute] = [:]
+            for source in sources {
+                let output = runRoute(PaneRoute(source: source, rawPaneId: ""), ["pane", "list"])
+                let parsed = parseAgents(from: output, source: source)
+                allAgents += parsed
+                for a in parsed { routes[a.id] = PaneRoute(source: source, rawPaneId: a.rawPaneId) }
             }
 
             DispatchQueue.main.async { [self] in
+                guard mode == .direct else { return }
+                paneRoutes = routes
                 isConnected = true
-                herdrError = nil  // Clear any previous error
+                herdrError = machines == nil ? "Machine discovery failed; registered machine actions unavailable." : nil
                 var seen = Set<String>()
                 for a in allAgents {
                     seen.insert(a.id)
                     if let existing = agents.first(where: { $0.id == a.id }) {
                         if existing.status != a.status {
                             if a.status == .blocked && existing.status != .blocked {
-                                readPaneForBlocked(existing, remote: a.host == "local" ? nil : a.host)
+                                readPaneForBlocked(existing)
                             }
                             existing.status = a.status
                         }
@@ -136,7 +211,7 @@ final class RelayConnection {
                     } else {
                         let agent = Agent(id: a.id, name: a.name, status: a.status, project: a.project, cwd: a.cwd, host: a.host, agentKind: a.agentKind)
                         agents.append(agent)
-                        if a.status == .blocked { readPaneForBlocked(agent, remote: a.host == "local" ? nil : a.host) }
+                        if a.status == .blocked { readPaneForBlocked(agent) }
                     }
                 }
                 agents.removeAll { !seen.contains($0.id) }
@@ -145,7 +220,7 @@ final class RelayConnection {
     }
 
     private struct ParsedAgent {
-        let id: String, name: String, status: AgentStatus, project: String, cwd: String, host: String, agentKind: String
+        let id: String, rawPaneId: String, name: String, status: AgentStatus, project: String, cwd: String, host: String, agentKind: String
     }
 
     private struct PaneLocation {
@@ -153,7 +228,7 @@ final class RelayConnection {
         let tabId: String
     }
 
-    private func parseAgents(from output: String, host: String) -> [ParsedAgent] {
+    private func parseAgents(from output: String, source: DirectRoute) -> [ParsedAgent] {
         guard let data = output.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let resultObj = json["result"] as? [String: Any],
@@ -161,10 +236,12 @@ final class RelayConnection {
 
         return panes.compactMap { p in
             guard let agent = p["agent"] as? String, !agent.isEmpty else { return nil }
-            let paneId = (host == "local" ? "" : "\(host):") + (p["pane_id"] as? String ?? "")
+            guard let rawPaneId = p["pane_id"] as? String, !rawPaneId.isEmpty else { return nil }
+            let identity = try! JSONSerialization.data(withJSONObject: [source.key, rawPaneId])
+            let paneId = String(data: identity, encoding: .utf8)!
             let status = AgentStatus(rawValue: p["agent_status"] as? String ?? "unknown") ?? .unknown
             let cwd = p["cwd"] as? String ?? ""
-            return ParsedAgent(id: paneId, name: paneTitle(p) ?? agent, status: status, project: (cwd as NSString).lastPathComponent, cwd: cwd, host: host, agentKind: agent)
+            return ParsedAgent(id: paneId, rawPaneId: rawPaneId, name: paneTitle(p) ?? agent, status: status, project: (cwd as NSString).lastPathComponent, cwd: cwd, host: source.display, agentKind: agent)
         }
     }
 
@@ -239,16 +316,13 @@ final class RelayConnection {
         KeychainHelper.deletePassword(for: remote)
     }
 
-    private func readPaneForBlocked(_ agent: Agent, remote: String? = nil) {
-        // Extract the real pane_id (strip host prefix if present)
-        let paneId = agent.id.contains(":") && remote != nil
-            ? String(agent.id.drop(while: { $0 != ":" }).dropFirst())
-            : agent.id
-
+    private func readPaneForBlocked(_ agent: Agent) {
+        guard let route = currentRoute(agent.id) else { return }
         DispatchQueue.global(qos: .utility).async { [self] in
-            let lines = readPromptLines(paneId, remote: remote)
-            let ansi = readPromptANSI(paneId, remote: remote)
+            let lines = readPromptLines(route)
+            let ansi = readPromptANSI(route)
             DispatchQueue.main.async {
+                guard self.currentRoute(agent.id)?.source.key == route.source.key else { return }
                 self.showPrompt(lines, ansi: ansi, on: agent)
                 self.sendNotification(agent: agent.name, project: agent.project)
             }
@@ -265,29 +339,19 @@ final class RelayConnection {
 
     /// The same screen as `readPromptLines`, with its colour codes. A row of choices side by side
     /// marks the selected one only by colour.
-    private func readPromptANSI(_ paneId: String, remote: String?) -> [String] {
-        let raw: String
-        if let remote {
-            raw = runSSH(remote, "herdr", "pane", "read", paneId, "--lines", "60", "--source", "visible", "--format", "ansi")
-        } else {
-            raw = runHerdr("pane", "read", paneId, "--lines", "60", "--source", "visible", "--format", "ansi")
-        }
+    private func readPromptANSI(_ route: PaneRoute) -> [String] {
+        let raw = runRoute(route, ["pane", "read", route.rawPaneId, "--lines", "60", "--source", "visible", "--format", "ansi"])
         return raw.components(separatedBy: .newlines)
     }
 
-    private func readPromptLines(_ paneId: String, remote: String?) -> [String] {
+    private func readPromptLines(_ route: PaneRoute) -> [String] {
         // `visible`, not `recent`, as the relay does (PROMPT_READ_SOURCE). `recent` past the
         // pane's viewport makes herdr harvest the extra rows by walking the agent's own
         // scroll interface, which moves the operator's terminal -- something a read fired by
         // a status change must never do. 20 rows sits inside most viewports, so this is
         // usually a no-op; on a pane split down under 20 rows it is not. The prompt is on
         // screen by definition, so nothing is given up either way.
-        let raw: String
-        if let remote {
-            raw = runSSH(remote, "herdr", "pane", "read", paneId, "--lines", "60", "--source", "visible")
-        } else {
-            raw = runHerdr("pane", "read", paneId, "--lines", "60", "--source", "visible")
-        }
+        let raw = runRoute(route, ["pane", "read", route.rawPaneId, "--lines", "60", "--source", "visible"])
         // Read the whole viewport, not a 20-row slice of it. `--source visible` never scrolls
         // the pane whatever the count, so the old limit bought nothing and cost the options:
         // a question rendered with a preview panel beside it pushes them well above the tail.
@@ -316,13 +380,20 @@ final class RelayConnection {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: herdrPath)
         process.arguments = Array(args)
+        if args.first == "--machine" {
+            var environment = ProcessInfo.processInfo.environment
+            for key in ["HERDR_SESSION", "HERDR_SOCKET_PATH"] { environment.removeValue(forKey: key) }
+            process.environment = environment
+        }
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         do {
             try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
             process.waitUntilExit()
-            return String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+            guard process.terminationStatus == 0 else { return "" }
+            return String(data: data, encoding: .utf8) ?? ""
         } catch {
             return ""
         }
@@ -333,6 +404,8 @@ final class RelayConnection {
     func connectRelay(to urlString: String) {
         guard let url = URL(string: urlString) else { return }
         mode = .relay
+        agents = []
+        paneRoutes = [:]
         hostAddress = urlString
         pollTimer?.invalidate()
         pollTimer = nil
@@ -353,6 +426,7 @@ final class RelayConnection {
     func send(response: ResponseMessage) {
         if mode == .direct {
             let paneId = response.pane_id
+            guard let route = currentRoute(paneId) else { return }
             let agent = agents.first(where: { $0.id == paneId })
             // The prompt the card showed when the answer was given. Read here, before the card
             // clears it, so the check below compares against what you actually saw.
@@ -364,11 +438,8 @@ final class RelayConnection {
                 let isMenuChoice = !response.text.isEmpty && response.text.allSatisfy(\.isNumber)
                 let verb = isMenuChoice ? "send-keys" : "send-text"
                 let payload = isMenuChoice ? response.text : response.text + "\n"
-                // Check if this is a remote agent (id starts with "host:")
-                let remote = agent.flatMap { $0.host != "local" ? $0.host : nil }
-                let targetId = remote == nil ? paneId : String(paneId.drop(while: { $0 != ":" }).dropFirst())
                 if isMenuChoice {
-                    let lines = readPromptLines(targetId, remote: remote)
+                    let lines = readPromptLines(route)
                     guard promptStillShown(shownPrompt, lines: lines) else {
                         // Not sent: the menu on screen is not the one on the card. Show the
                         // current one instead, so the next answer is to what is really there.
@@ -380,11 +451,7 @@ final class RelayConnection {
                         return
                     }
                 }
-                if let remote {
-                    _ = runSSH(remote, "herdr", "pane", verb, targetId, payload)
-                } else {
-                    _ = runHerdr("pane", verb, targetId, payload)
-                }
+                _ = runRoute(route, ["pane", verb, route.rawPaneId, payload])
             }
 
         } else {
@@ -410,21 +477,13 @@ final class RelayConnection {
     }
 
     func focusPane(_ paneId: String) {
+        // Focusing has no relay protocol equivalent. Never reinterpret a relay ID locally.
+        guard let route = currentRoute(paneId) else { return }
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            if let agent = agents.first(where: { $0.id == paneId }), agent.host != "local" {
-                let prefix = agent.host + ":"
-                let remotePaneId = paneId.hasPrefix(prefix) ? String(paneId.dropFirst(prefix.count)) : paneId
-                let output = runSSH(agent.host, "herdr", "pane", "get", remotePaneId)
-                guard let location = parsePaneLocation(from: output) else { return }
-                _ = runSSH(agent.host, "herdr", "workspace", "focus", location.workspaceId)
-                _ = runSSH(agent.host, "herdr", "tab", "focus", location.tabId)
-                return
-            }
-
-            let output = runHerdr("pane", "get", paneId)
+            let output = runRoute(route, ["pane", "get", route.rawPaneId])
             guard let location = parsePaneLocation(from: output) else { return }
-            _ = runHerdr("workspace", "focus", location.workspaceId)
-            _ = runHerdr("tab", "focus", location.tabId)
+            _ = runRoute(route, ["workspace", "focus", location.workspaceId])
+            _ = runRoute(route, ["tab", "focus", location.tabId])
         }
     }
 
@@ -442,13 +501,12 @@ final class RelayConnection {
             task?.send(.string(text)) { _ in }
             return
         }
+        guard let route = currentRoute(paneId) else { return }
         let agent = agents.first(where: { $0.id == paneId })
-        let remote = agent.flatMap { $0.host != "local" ? $0.host : nil }
-        let targetId = remote == nil ? paneId : String(paneId.drop(while: { $0 != ":" }).dropFirst())
         DispatchQueue.global(qos: .userInitiated).async { [self] in
             if menu != nil || shownPrompt != nil {
-                let lines = readPromptLines(targetId, remote: remote)
-                let ansi = readPromptANSI(targetId, remote: remote)
+                let lines = readPromptLines(route)
+                let ansi = readPromptANSI(route)
                 let unchanged = menu.map { detectChoiceMenu(plain: lines, ansi: ansi) == $0 }
                     ?? promptStillShown(shownPrompt, lines: lines)
                 guard unchanged else {
@@ -460,14 +518,10 @@ final class RelayConnection {
                 }
             }
             // One call for every key, so nothing on screen can change between them.
-            if let remote {
-                _ = runSSH(remote, arguments: ["herdr", "pane", "send-keys", targetId] + keys)
-            } else {
-                _ = runHerdr(arguments: ["pane", "send-keys", targetId] + keys)
-            }
+            _ = runRoute(route, ["pane", "send-keys", route.rawPaneId] + keys)
             Thread.sleep(forTimeInterval: 0.2)
-            let lines = readPromptLines(targetId, remote: remote)
-            let ansi = readPromptANSI(targetId, remote: remote)
+            let lines = readPromptLines(route)
+            let ansi = readPromptANSI(route)
             DispatchQueue.main.async {
                 guard let agent else { return }
                 self.showPrompt(lines, ansi: ansi, on: agent)
@@ -476,8 +530,13 @@ final class RelayConnection {
     }
 
     func interruptPane(_ paneId: String) {
+        if mode == .relay {
+            sendKeys(["C-c"], to: paneId)
+            return
+        }
+        guard let route = currentRoute(paneId) else { return }
         DispatchQueue.global(qos: .userInitiated).async { [self] in
-            _ = runHerdr("pane", "send-keys", paneId, "Ctrl+c")
+            _ = runRoute(route, ["pane", "send-keys", route.rawPaneId, "Ctrl+c"])
         }
     }
 
@@ -555,13 +614,13 @@ final class RelayConnection {
             existing.status = AgentStatus(rawValue: data.status) ?? .unknown
             existing.project = data.project
             existing.cwd = data.cwd
-            existing.host = data.host ?? "local"
+            existing.host = data.source_label.flatMap { $0.isEmpty ? nil : $0 } ?? data.host ?? "local"
             return
         }
         agents.append(Agent(
             id: data.pane_id, name: data.agent,
             status: AgentStatus(rawValue: data.status) ?? .unknown,
-            project: data.project, cwd: data.cwd, host: data.host ?? "local",
+            project: data.project, cwd: data.cwd, host: data.source_label.flatMap { $0.isEmpty ? nil : $0 } ?? data.host ?? "local",
             agentKind: data.agent
         ))
     }

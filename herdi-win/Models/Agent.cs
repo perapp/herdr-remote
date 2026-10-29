@@ -38,9 +38,8 @@ public static class AgentStatusParser
 public sealed class Agent : INotifyPropertyChanged
 {
     /// <summary>
-    /// Separates the source key from the pane id in <see cref="Id"/>. A vertical bar cannot
-    /// occur in either half — a herdr pane id is `w&lt;n&gt;:p&lt;n&gt;` and a source key is a
-    /// WebSocket URL or the literal "direct" — so the composite never has to be un-parsed.
+    /// Separates a length-prefixed source key from an opaque pane id. Neither half is
+    /// parsed for routing; the length prefix prevents delimiter collisions.
     /// </summary>
     private const char SourceSeparator = '|';
 
@@ -75,7 +74,7 @@ public sealed class Agent : INotifyPropertyChanged
     /// until the next tick.
     /// </summary>
     public static string ComposeId(string sourceId, string paneId) =>
-        sourceId + SourceSeparator + paneId;
+        sourceId.Length + ":" + sourceId + SourceSeparator + paneId;
 
     /// <summary>
     /// Unique across every source this client is watching, which is why it is composite:
@@ -89,10 +88,14 @@ public sealed class Agent : INotifyPropertyChanged
 
     /// <summary>
     /// The pane id as the owning source knows it, i.e. what goes out in a relay message or
-    /// a herdr CLI argument. In direct mode this still carries the host prefix
-    /// HerdrPoller.ParsePanes puts on a remote pane, and HerdrPoller.PaneIdOf takes it off.
+    /// a relay message. Direct mode uses a route-qualified collection key here and keeps
+    /// the native CLI argument separately in RawPaneId.
     /// </summary>
     public string PaneId { get; }
+
+    /// <summary>Direct CLI identity, separate from the opaque UI/relay pane id.</summary>
+    public string? RawPaneId { get; init; }
+    public DirectRoute? Route { get; init; }
 
     /// <summary>Which source reported this pane: a relay URL, or <see cref="DirectSource"/>.</summary>
     public string SourceId { get; }

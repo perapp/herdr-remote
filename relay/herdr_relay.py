@@ -64,6 +64,15 @@ except ModuleNotFoundError:
     command_catalog = module_from_spec(_commands_spec)
     _commands_spec.loader.exec_module(command_catalog)
 
+try:
+    import sources as machine_sources
+except ModuleNotFoundError:
+    from importlib.util import module_from_spec, spec_from_file_location
+    _sources_spec = spec_from_file_location("herdr_remote_sources", os.path.join(os.path.dirname(__file__), "sources.py"))
+    machine_sources = module_from_spec(_sources_spec)
+    _sources_spec.loader.exec_module(machine_sources)
+
+
 def _get_log_dir():
     if sys.platform == "darwin":
         return os.path.expanduser("~/Library/Logs/herdr-remote")
@@ -142,6 +151,11 @@ ACTIVE_SESSIONS = {}
 
 def active_session_for(remote=None):
     """Session name for one source, or None for herdr's default session."""
+    if remote and remote.startswith("machine:"):
+        profile = MACHINE_REGISTRY.machines.get(remote)
+        if profile is None:
+            raise ValueError("machine source is no longer registered")
+        return profile["session"]
     if remote in ACTIVE_SESSIONS:
         return ACTIVE_SESSIONS[remote]
     return DEFAULT_LOCAL_SESSION if remote is None else None
@@ -235,6 +249,110 @@ if RELAY_HOST not in {"127.0.0.1", "localhost", "::1"} and not AUTH_TOKEN:
 
 # Remote hosts: comma-separated SSH targets
 REMOTES = [r.strip() for r in os.environ.get("HERDR_REMOTES", "").split(",") if r.strip()]
+
+MACHINE_REGISTRY = machine_sources.MachineRegistry(os.environ.get("HERDR_MACHINES", ""))
+source_bindings = {}  # wire id -> (logical source, native id, fingerprint)
+source_status = {}
+_source_panes = {}  # last good per-source records
+
+
+def source_target(remote):
+    if remote and remote.startswith("machine:"):
+        profile = MACHINE_REGISTRY.machines.get(remote)
+        if profile is None:
+            raise ValueError("machine source is no longer registered")
+        return profile["target"]
+    return remote
+
+
+def source_fingerprint(remote):
+    return machine_sources.fingerprint(remote, active_session_for(remote), source_target(remote))
+
+
+def source_keys():
+    return [None, *REMOTES, *MACHINE_REGISTRY.machines]
+
+
+def refresh_sources():
+    global POLL_GENERATION, spaces_dirty
+    def discover():
+        proc = subprocess.run([HERDR, "machine", "list", "--json"], capture_output=True,
+                              text=True, encoding="utf-8", errors="replace", timeout=5,
+                              env=_herdr_env(None))
+        if proc.returncode:
+            raise ValueError("machine discovery failed")
+        return proc.stdout
+    if MACHINE_REGISTRY.refresh(discover):
+        transcript.cache_clear()
+        POLL_GENERATION += 1
+        spaces_dirty = True
+        for wire, (source, native, version) in list(source_bindings.items()):
+            try:
+                current = source_fingerprint(source)
+            except ValueError:
+                current = None
+            if version == current:
+                continue
+            source_bindings.pop(wire, None)
+            known_panes.discard(wire)
+            pane_remote_map.pop(wire, None)
+            pane_session_map.pop(wire, None)
+            agent_cache.pop(wire, None)
+            shell_pane_map.pop(wire, None)
+        for host in list(pane_list_ok):
+            if host.startswith("machine:") and host not in MACHINE_REGISTRY.machines:
+                pane_list_ok[host] = False
+        for field in ("workspaces", "tabs"):
+            spaces_cache[field] = [record for record in spaces_cache[field]
+                                   if not str(record.get("remote", "")).startswith("machine:")
+                                   or record.get("remote") in MACHINE_REGISTRY.machines]
+    return MACHINE_REGISTRY.generation
+
+
+def bind_source_id(remote, raw, expected_version=None):
+    if not raw:
+        return raw
+    with MACHINE_REGISTRY._lock:
+        session, target = active_session_for(remote), source_target(remote)
+        version = machine_sources.fingerprint(remote, session, target)
+        if expected_version is not None and version != expected_version:
+            raise ValueError("source changed during read")
+        # The default local session retains its historical IDs. Explicit local
+        # sessions are scoped too, so delayed controls cannot cross a switch.
+        identity = "local" if remote is None and session else remote
+        wire = machine_sources.wire_id(identity, session, target, raw)
+        if wire != raw:
+            existing = source_bindings.get(wire)
+            if existing is not None and existing != (remote, raw, version):
+                raise ValueError("source identifier collision")
+            source_bindings[wire] = (remote, raw, version)
+        return wire
+
+
+def translate_source_args(args, remote):
+    """Translate only CLI identifier slots, never message text, labels or keys."""
+    args = list(args)
+    positions = {i + 1 for i, arg in enumerate(args[:-1]) if arg in {"--pane", "--tab", "--workspace"}}
+    if len(args) > 2:
+        command = tuple(args[:2])
+        if command in {("pane", "read"), ("pane", "send-keys"), ("pane", "send-text"),
+                       ("agent", "focus"), ("agent", "rename"), ("agent", "prompt"),
+                       ("tab", "focus"), ("tab", "rename"), ("tab", "close"),
+                       ("workspace", "focus"), ("workspace", "rename"), ("workspace", "close")}:
+            if not str(args[2]).startswith("--"):
+                positions.add(2)
+    for index in positions:
+        value = args[index]
+        binding = source_bindings.get(value)
+        if binding is not None:
+            source, native, version = binding
+            if source != remote or version != source_fingerprint(remote):
+                raise ValueError("stale pane/source binding")
+            args[index] = native
+        elif (remote is not None and remote.startswith("machine:")) or (isinstance(value, str) and re.match(r"r[0-9a-f]{20}\.", value)):
+            raise ValueError("unknown pane/source binding")
+    return args
+
 
 TOOL_OPTIONS = ["yes, single permission", "trust, always allow", "no (tab to edit)"]
 SUBAGENT_OPTIONS = ["approve all pending", "configure individually", "exit (cancel subagents)"]
@@ -946,6 +1064,28 @@ def _remote_lock(remote):
         return remote_lock
 
 
+def validate_machine_profile(remote):
+    """Check authoritative routing at dispatch, not just the discovery TTL.
+
+    Herdr resolves --machine against its current configuration, independently of
+    this relay's snapshot. Never apply a saved pane binding to a changed profile.
+    A failed validation refuses the command rather than using last-good routing.
+    """
+    expected = MACHINE_REGISTRY.machines.get(remote)
+    if expected is None:
+        raise ValueError("unknown machine source")
+    proc = subprocess.run([HERDR, "machine", "list", "--json"], capture_output=True,
+                          text=True, encoding="utf-8", errors="replace", timeout=5,
+                          env=_herdr_env(None))
+    if proc.returncode:
+        raise ValueError("cannot validate machine configuration")
+    current = MACHINE_REGISTRY.parse(proc.stdout).get(remote)
+    if current is None or any(current[k] != expected[k] for k in ("id", "target", "session")):
+        MACHINE_REGISTRY._checked = None  # discovery must reconcile before a new snapshot
+        raise ValueError("machine configuration changed; refresh required")
+    return dict(current)
+
+
 def _invoke_herdr(*args, remote=None):
     """Run one herdr command, locally or over SSH. BLOCKING -- never call this from the loop.
 
@@ -958,6 +1098,17 @@ def _invoke_herdr(*args, remote=None):
     worker threads need no further synchronising.
     """
     session = active_session_for(remote)
+    version = source_fingerprint(remote)
+    args = translate_source_args(args, remote)
+    if remote and remote.startswith("machine:"):
+        profile = validate_machine_profile(remote)
+        if machine_sources.fingerprint(remote, profile["session"], profile["target"]) != version:
+            raise ValueError("machine configuration changed during dispatch")
+        if args and args[0] == "session":
+            raise ValueError("registered machine sessions are fixed")
+        return subprocess.run([HERDR, "--machine", profile["id"], *args],
+                              capture_output=True, text=True, encoding="utf-8", errors="replace",
+                              timeout=15, env=_herdr_env(None))
     if remote:
         cmd = ["ssh", *SSH_BASE_ARGS, remote]
         if session:
@@ -980,6 +1131,7 @@ def transcript_ssh(remote, script, ssh_args=()):
     Bytes, not text: the reply is a framed header plus a raw tail of the transcript, and the cut
     has to be made on a byte boundary before anything tries to decode it.
     """
+    remote = source_target(remote)
     cmd = ["ssh", *ssh_args, remote, "sh -c " + shlex.quote(script)]
     with _remote_lock(remote):
         proc = subprocess.run(cmd, capture_output=True, timeout=transcript.REMOTE_TIMEOUT)
@@ -987,6 +1139,25 @@ def transcript_ssh(remote, script, ssh_args=()):
         log.warning("transcript ssh on %s exited %s: %s", remote, proc.returncode,
                     proc.stderr.decode("utf-8", "replace").strip()[:200])
     return proc.returncode, proc.stdout
+
+
+def source_file_transport(remote):
+    """Capture the physical endpoint for an entire file request, including retries.
+
+    A profile refresh must not send an old transcript ref to its new target.
+    The cache key also includes the routing revision so a late old read cannot
+    repopulate the new profile's cache after cache_clear().
+    """
+    with MACHINE_REGISTRY._lock:
+        if remote not in MACHINE_REGISTRY.machines:
+            return remote, transcript_ssh
+        target = source_target(remote)
+        cache_source = remote + "/" + source_fingerprint(remote)
+
+    def run(_source, script, ssh_args=()):
+        return transcript_ssh(target, script, ssh_args)
+
+    return cache_source, run
 
 
 def upload_ssh(remote, script, stdin_path, timeout=UPLOAD_SSH_TIMEOUT):
@@ -997,6 +1168,7 @@ def upload_ssh(remote, script, stdin_path, timeout=UPLOAD_SSH_TIMEOUT):
     lock would stall that host's polls -- and every read a client asks for -- for as long as it
     runs. The script never calls herdr, so there is nothing for the lock to protect it from.
     """
+    remote = source_target(remote)
     cmd = ["ssh", *SSH_BASE_ARGS, remote, "sh -c " + shlex.quote(script)]
     with open(stdin_path, "rb") as source:
         proc = subprocess.run(cmd, stdin=source, capture_output=True, timeout=timeout)
@@ -1006,7 +1178,12 @@ def upload_ssh(remote, script, stdin_path, timeout=UPLOAD_SSH_TIMEOUT):
     return proc.returncode, proc.stdout
 
 
-def store_upload(spool_path, pane_id, name):
+def upload_binding(pane_id):
+    remote = pane_remote_map.get(pane_id)
+    return (POLL_GENERATION, remote, active_session_for(remote), source_fingerprint(remote))
+
+
+def store_upload(spool_path, pane_id, name, expected_binding=None):
     """Put a finished spool file where the pane's agent can read it, and record the folder. BLOCKING.
 
     Returns the absolute path on the agent's machine. The folder follows the pane's agent session
@@ -1017,13 +1194,24 @@ def store_upload(spool_path, pane_id, name):
     The ref and the session come from pane_refs_by_host, the read the sweep compares against, so
     the folder's name, the ledger's `ref` and its `session` all describe one `pane list`.
     """
+    if expected_binding is not None and (pane_id not in known_panes or upload_binding(pane_id) != expected_binding):
+        raise ValueError("upload source/session changed")
     remote = pane_remote_map.get(pane_id)
+    physical_target = source_target(remote)
+    source_version = source_fingerprint(remote)
+    if expected_binding is not None and source_version != expected_binding[-1]:
+        raise ValueError("upload source/session changed during placement")
     session, refs = pane_refs_by_host.get(pane_host(pane_id), (active_session_for(remote), {}))
     ref = refs.get(pane_id)
-    folder = uploads.folder_for_key(pane_id, ref)
+    # The same session ref can appear in two profiles (or an SSH alias) on one physical
+    # host. Scope remote folders so retiring one logical source cannot delete another's file.
+    folder = uploads.folder_for_key(
+        source_version + ":" + pane_id if remote else pane_id,
+        source_version + ":" + ref if remote and ref is not None else ref,
+    )
     name = uploads.stored_name(uploads.clean_name(name), secrets.token_hex(4))
     if remote:
-        code, out = upload_ssh(remote, uploads.remote_write_script(folder, name), spool_path)
+        code, out = upload_ssh(physical_target, uploads.remote_write_script(folder, name), spool_path)
         lines = out.decode("utf-8", "replace").strip().splitlines()
         if code != 0 or not lines:
             raise OSError(f"upload to {remote} exited {code}")
@@ -1034,6 +1222,8 @@ def store_upload(spool_path, pane_id, name):
     entry = {
         "host": remote or "local",
         "remote": remote,
+        "physical_target": physical_target,
+        "source_fingerprint": source_version,
         "session": session,
         "pane_id": pane_id,
         "folder": folder,
@@ -1075,17 +1265,36 @@ def _sweep_host(host, session, live):
     rewrite drops the ended entries by identity rather than replacing the list with a stale copy.
     """
     remote = None if host == "local" else host
+    cleanup_target = remote
+    if remote and remote.startswith("machine:"):
+        profile = MACHINE_REGISTRY.machines.get(remote)
+        if profile is None:
+            return
+        cleanup_target = profile["target"]
+        version = machine_sources.fingerprint(remote, profile["session"], cleanup_target)
+        if session != profile["session"]:
+            return
     with _upload_ledger_lock:
-        ended = uploads.ended_entries(upload_ledger, host, session, live)
+        candidates = upload_ledger
+        if remote and remote.startswith("machine:"):
+            # Historical generations have no authoritative live set. They are TTL-only;
+            # their presence must not prevent retirement of current-generation uploads.
+            candidates = [entry for entry in upload_ledger
+                          if entry.get("physical_target") == cleanup_target
+                          and entry.get("source_fingerprint") == version]
+        ended = uploads.ended_entries(candidates, host, session, live)
         ended_ids = {id(entry) for entry in ended}
         # Folders are per host, not per herdr session: two sessions' `w1:p1` with no ref share one.
         still_used = {entry["folder"] for entry in upload_ledger
-                      if entry["host"] == host and id(entry) not in ended_ids}
+                      if id(entry) not in ended_ids and (
+                          entry.get("physical_target", entry.get("remote")) == cleanup_target
+                          or (str(entry.get("remote", "")).startswith("machine:")
+                              and "physical_target" not in entry))}
     if not ended:
         return
     folders = sorted({entry["folder"] for entry in ended} - still_used)
     if folders and remote:
-        if not _remote_upload_script(remote, uploads.remote_delete_script(folders)):
+        if not _remote_upload_script(cleanup_target, uploads.remote_delete_script(folders)):
             return  # the entries stay, so the next forced or changed sweep tries again
     elif folders:
         uploads.delete_local_folders(UPLOAD_ROOT, folders)
@@ -1141,30 +1350,51 @@ def clear_upload_spool():
 
 
 def expire_uploads():
-    """Rule 2 of the upload sweep: the TTL, on this host and every remote. BLOCKING.
+    """Rule 2: expire files, retaining machine ledger entries until remote cleanup succeeds.
 
-    Files past the TTL go first, then empty folders, then the ledger entries past the TTL and the
-    local ones whose folder is gone. A remote entry is not checked for its folder, since that would
-    cost an SSH call per entry. The TTL alone retires it.
-
-    A remote host runs the script only when its last `pane list` read clean. One that failed is
-    likely unreachable, and each try would cost the poll the whole SSH timeout.
+    Legacy SSH sources still require a successful pane list. Historical machine uploads
+    instead use their recorded physical endpoint, even after a profile is removed or changed.
+    Each endpoint gets at most one bounded transport call, not one per ledger entry.
     """
     now = time.time()
     ttl_seconds = UPLOAD_TTL_HOURS * 3600
+    cutoff = now - ttl_seconds
     try:
         uploads.expire_local(UPLOAD_ROOT, ttl_seconds, now)
     except OSError as exc:
         log.warning("upload expiry on this host failed: %s", exc)
     script = uploads.remote_expire_script(UPLOAD_TTL_HOURS * 60)
-    for remote in REMOTES:
-        if pane_list_ok.get(remote) is not True:
+    targets = dict.fromkeys(remote for remote in REMOTES if pane_list_ok.get(remote) is True)
+    with _upload_ledger_lock:
+        entries = list(upload_ledger)
+    machine_targets = {}
+    orphan_hosts = set()
+    for entry in entries:
+        if not entry["host"].startswith("machine:"):
             continue
-        if not _remote_upload_script(remote, script):
-            log.warning("upload expiry on %s did not run clean", remote)
-    cutoff = now - ttl_seconds
+        target = entry.get("physical_target")
+        # Never resolve a logical profile ID, infer an endpoint from today's registry,
+        # or pass an unvalidated ledger value through SSH's option parser.
+        if (not isinstance(target, str) or not target or target.startswith(("-", "machine:"))
+                or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in target)):
+            orphan_hosts.add(entry["host"])
+            continue
+        machine_targets[id(entry)] = target
+        if entry["at"] < cutoff:
+            targets[target] = None
+    for host in sorted(orphan_hosts):
+        log.warning("orphaned machine uploads on %s: missing or unsafe recorded physical target; "
+                    "retaining ledger for manual cleanup", host)
+    cleaned = set()
+    for target in targets:
+        if _remote_upload_script(target, script):
+            cleaned.add(target)
+        else:
+            log.warning("upload expiry on %s did not run clean", target)
 
     def keep(entry):
+        if entry["host"].startswith("machine:"):
+            return entry["at"] >= cutoff or machine_targets.get(id(entry)) not in cleaned
         if entry["at"] < cutoff:
             return False
         return entry["host"] != "local" or os.path.isdir(os.path.join(UPLOAD_ROOT, entry["folder"]))
@@ -1309,6 +1539,8 @@ def shell_pane_record(pane, host_label, remote, order=0):
         "project": os.path.basename(pane.get("cwd", "")),
         "host": host_label,
         "remote": remote,
+        **({"source_label": MACHINE_REGISTRY.machines[remote]["label"]}
+           if remote in MACHINE_REGISTRY.machines else {}),
         "workspace_id": grouping_id("workspace_id", pane.get("workspace_id", "")),
         "tab_id": grouping_id("tab_id", pane.get("tab_id", "")),
         "focused": bool(pane.get("focused")),
@@ -1338,6 +1570,7 @@ def list_panes_from_host(remote=None):
     client only ever compares panes within one tab of one machine.
     """
     session_at_read = active_session_for(remote)
+    fingerprint_at_read = source_fingerprint(remote)
     raw = run_herdr("pane", "list", remote=remote)
     host_label = remote or "local"
     try:
@@ -1351,20 +1584,32 @@ def list_panes_from_host(remote=None):
     panes = result.get("panes") if isinstance(result, dict) else None
     if not isinstance(panes, list):
         pane_list_ok[host_label] = False
+        source_status[host_label] = {"ok": False, "error": "pane list unavailable"}
+        cached = _source_panes.get(remote)
+        if cached and cached[0] == fingerprint_at_read:
+            return ([dict(p) for p in cached[1]], [dict(p) for p in cached[2]])
         return [], []
     pane_list_ok[host_label] = True
+    source_status[host_label] = {"ok": True}
     refs = {}
     workspace_labels = get_workspace_labels(remote=remote) if panes else {}
     agent_names = get_agent_names(remote=remote) if panes else {}
 
     agents, shells = [], []
     for order, p in enumerate(panes):
+        if not isinstance(p, dict):
+            continue
         # The ids are copied verbatim out of herdr -- over SSH for every HERDR_REMOTES target --
         # and land inside quoted strings in clients that do no escaping of their own. A pane
         # whose id could break out of one is dropped here, before anything caches or broadcasts
         # it; there is no pane this relay can usefully name without its id anyway.
         if not accept_id("pane_id", p.get("pane_id")):
             continue
+        p = dict(p)
+        native_id = p["pane_id"]
+        p["pane_id"] = bind_source_id(remote, native_id, fingerprint_at_read)
+        for field in ("workspace_id", "tab_id"):
+            p[field] = bind_source_id(remote, grouping_id(field, p.get(field, "")), fingerprint_at_read)
         if not p.get("agent") and not (
             isinstance(p.get("agent_session"), dict)
             and p["agent_session"].get("agent")
@@ -1394,9 +1639,11 @@ def list_panes_from_host(remote=None):
             # The agent's name first, the pane's label second. herdr keeps the two apart and
             # `pane list` only carries the latter, which nothing sets by default -- so this field
             # was empty for every agent on the host and clients fell back to the pane id.
-            "label": agent_names.get(p["pane_id"]) or p.get("label", ""),
+            "label": agent_names.get(native_id) or p.get("label", ""),
             # Names the space, and stands in for panes that have no label.
-            "workspace_label": workspace_labels.get(p.get("workspace_id", ""), ""),
+            "workspace_label": workspace_labels.get(source_bindings.get(p.get("workspace_id"), (None, p.get("workspace_id")))[1], ""),
+            **({"source_label": MACHINE_REGISTRY.machines[remote]["label"], "raw_pane_id": native_id}
+               if remote in MACHINE_REGISTRY.machines else {}),
             "status": p.get("agent_status", "unknown"),
             "cwd": p.get("cwd", ""),
             "project": os.path.basename(p.get("cwd", "")),
@@ -1423,8 +1670,11 @@ def list_panes_from_host(remote=None):
             "has_session": session is not None,
         })
     # A switch that landed mid-read leaves no way to know which session herdr answered for.
+    if source_fingerprint(remote) != fingerprint_at_read:
+        return [], []
     if active_session_for(remote) == session_at_read:
         pane_refs_by_host[host_label] = (session_at_read, refs)
+    _source_panes[remote] = (fingerprint_at_read, [dict(p) for p in agents], [dict(p) for p in shells])
     return agents, shells
 
 
@@ -1462,6 +1712,11 @@ def pane_layout(pane_id, remote=None):
         return None
     if not isinstance(layout, dict) or not layout.get("panes"):
         return None
+    if remote or active_session_for(remote):
+        layout = dict(layout)
+        layout["focused_pane_id"] = bind_source_id(remote, layout.get("focused_pane_id"))
+        layout["panes"] = [{**p, "pane_id": bind_source_id(remote, p.get("pane_id"))}
+                           for p in layout["panes"]]
     return layout
 
 
@@ -1538,12 +1793,19 @@ def get_agents_from_host(remote=None):
 
 
 def get_all_panes():
-    agents, shells = list_panes_from_host(remote=None)
-    for remote in REMOTES:
-        more_agents, more_shells = list_panes_from_host(remote=remote)
-        agents.extend(more_agents)
-        shells.extend(more_shells)
-    return agents, shells
+    refresh_sources()
+    from concurrent.futures import ThreadPoolExecutor
+    keys = source_keys()
+    def read(source):
+        try:
+            return list_panes_from_host(remote=source)
+        except Exception:
+            source_status[source or "local"] = {"ok": False, "error": "source unavailable"}
+            return [], []
+    with ThreadPoolExecutor(max_workers=min(8, len(keys))) as pool:
+        results = list(pool.map(read, keys))
+    return ([p for agents, _ in results for p in agents],
+            [p for _, shells in results for p in shells])
 
 
 def get_all_agents():
@@ -1562,6 +1824,8 @@ def get_sessions(remote=None):
     through this cache, which keeps it checking against the same list the
     user was actually shown rather than a fresher one they never saw.
     """
+    if remote and remote.startswith("machine:"):
+        return [{"name": active_session_for(remote), "running": True}]
     cached = _session_list_cache.get(remote)
     if cached is not None and time.monotonic() - cached[0] < SESSION_LIST_CACHE_TTL:
         return cached[1]
@@ -1614,6 +1878,7 @@ def update_pane_maps(agents, shells=()):
             # anything, and a second policy beside it would be a second thing to keep true.
             activity_forget(pane_host(pane_id), pane_id)
             pane_remote_map.pop(pane_id, None)
+            source_bindings.pop(pane_id, None)
             pane_session_map.pop(pane_id, None)
             last_statuses.pop(pane_id, None)
             last_blocked_prompts.pop(pane_id, None)
@@ -1647,6 +1912,14 @@ def reset_pane_state():
     known_panes.clear()
     agent_cache.clear()
     pane_remote_map.clear()
+    pane_session_map.clear()
+    shell_pane_map.clear()
+    source_bindings.clear()
+    _source_panes.clear()
+    workspace_remote_map.clear()
+    tab_remote_map.clear()
+    spaces_cache["workspaces"] = []
+    spaces_cache["tabs"] = []
     last_statuses.clear()
     last_blocked_prompts.clear()
     _session_list_cache.clear()
@@ -1662,7 +1935,7 @@ def _source_key(host):
     """Map a client-supplied host to a source key, or raise KeyError."""
     if host in (None, "", "local"):
         return None
-    if host in REMOTES:
+    if host in REMOTES or host in MACHINE_REGISTRY.machines:
         return host
     raise KeyError(host)
 
@@ -1679,6 +1952,8 @@ def session_switch_names(host):
         source = _source_key(host)
     except KeyError:
         return None
+    if source in MACHINE_REGISTRY.machines:
+        return set()
     return {entry["name"] for entry in get_sessions(remote=source)}
 
 
@@ -1703,6 +1978,9 @@ def apply_session_switch(host, session, ip="", device="", *, names):
         source = _source_key(host)
     except KeyError:
         return False, f"unknown host: {host}", False
+
+    if source in MACHINE_REGISTRY.machines:
+        return False, "registered machines use their configured session", False
 
     # Re-selecting the already-active session is a no-op: skip the pane-state reset below.
     # `source in ACTIVE_SESSIONS` (not `.get()`) matters here -- a key that
@@ -1739,13 +2017,19 @@ SESSION_LIST_CACHE_TTL = SESSION_REFRESH_EVERY * POLL_INTERVAL   # 30s
 def sessions_message():
     """Per-source session lists and the active selection for each."""
     sources = []
-    for source in [None, *REMOTES]:
+    for source in source_keys():
+        profile = MACHINE_REGISTRY.machines.get(source, {})
         sources.append({
+            "kind": profile.get("kind", "local" if source is None else "ssh"),
+            "label": profile.get("label", source or "local"),
+            "switchable": source not in MACHINE_REGISTRY.machines,
+            "status": source_status.get(source or "local", {}),
             "host": "local" if source is None else source,
             "active": active_session_for(source),
             "sessions": get_sessions(remote=source),
         })
-    return {"type": "sessions", "sources": sources}
+    return {"type": "sessions", "sources": sources,
+            "discovery_error": MACHINE_REGISTRY.error}
 
 
 async def broadcast_sessions():
@@ -1780,6 +2064,7 @@ _spaces_ticks = 0
 def get_spaces_from_host(remote=None):
     """The workspaces and tabs one herdr reports, flattened and tagged with their host."""
     host_label = remote or "local"
+    version = source_fingerprint(remote)
     workspaces = []
     tabs = []
 
@@ -1832,16 +2117,30 @@ def get_spaces_from_host(remote=None):
             "remote": remote,
         })
 
+    if source_fingerprint(remote) != version:
+        raise ValueError("source changed during hierarchy read")
+    if remote or active_session_for(remote):
+        for record in [*workspaces, *tabs]:
+            for field in ("workspace_id", "tab_id", "active_tab_id"):
+                if record.get(field):
+                    record[field] = bind_source_id(remote, record[field], version)
+            if remote in MACHINE_REGISTRY.machines:
+                record["source_label"] = MACHINE_REGISTRY.machines[remote]["label"]
     return workspaces, tabs
 
 
 def get_all_spaces():
-    workspaces, tabs = get_spaces_from_host(remote=None)
-    for remote in REMOTES:
-        more_workspaces, more_tabs = get_spaces_from_host(remote=remote)
-        workspaces.extend(more_workspaces)
-        tabs.extend(more_tabs)
-    return {"workspaces": workspaces, "tabs": tabs}
+    from concurrent.futures import ThreadPoolExecutor
+    keys = source_keys()
+    def read(source):
+        try:
+            return get_spaces_from_host(remote=source)
+        except Exception:
+            return [], []
+    with ThreadPoolExecutor(max_workers=min(8, len(keys))) as pool:
+        results = list(pool.map(read, keys))
+    return {"workspaces": [w for workspaces, _ in results for w in workspaces],
+            "tabs": [t for _, tabs in results for t in tabs]}
 
 
 def update_space_maps(spaces):
@@ -1857,7 +2156,15 @@ def refresh_spaces(force=False):
     """Re-read the hierarchy when it is due, and return whatever the cache holds now."""
     global spaces_dirty, _spaces_ticks
     if force or spaces_dirty or _spaces_ticks % SPACES_POLL_INTERVAL == 0:
+        generation = POLL_GENERATION
+        versions = {key: source_fingerprint(key) for key in source_keys()}
         spaces = get_all_spaces()
+        if generation != POLL_GENERATION or any(
+            key not in source_keys() or source_fingerprint(key) != version
+            for key, version in versions.items()
+        ):
+            spaces_dirty = True
+            return spaces_cache
         # An empty result means the CLI call failed (herdr always has at least one workspace);
         # keep the last good hierarchy rather than blanking every client's chip strip.
         if spaces["workspaces"]:
@@ -2832,9 +3139,12 @@ def respond_to_question(pane_id, text, question, remote=None):
 
 
 async def broadcast(msg):
+    gen = POLL_GENERATION
     data = json.dumps(msg)
     dead = set()
     for ws in list(clients):
+        if gen != POLL_GENERATION:
+            break
         try:
             await ws.send(data)
         except (ConnectionClosedError, ConnectionClosedOK):
@@ -2858,8 +3168,11 @@ async def rebroadcast_blocked(pane_id, remote=None):
     last_blocked_prompts is updated here too, so _poll_once sees this state as already announced
     and does not re-fire the web push for it.
     """
+    gen = POLL_GENERATION
     cached = agent_cache.get(pane_id, {})
     content = await asyncio.to_thread(read_pane, pane_id, remote=remote)
+    if gen != POLL_GENERATION:
+        return
     message = blocked_message(
         pane_id,
         cached.get("agent", ""),
@@ -2875,8 +3188,15 @@ async def rebroadcast_blocked(pane_id, remote=None):
 
 
 async def send_current_snapshot(ws):
-    await ws.send(json.dumps(await asyncio.to_thread(sessions_message)))
+    await asyncio.to_thread(refresh_sources)
+    gen = POLL_GENERATION
+    sessions = await asyncio.to_thread(sessions_message)
+    if gen != POLL_GENERATION:
+        return
+    await ws.send(json.dumps(sessions))
     agents, shells = await asyncio.to_thread(get_all_panes)
+    if gen != POLL_GENERATION:
+        return
     # A pane the poll has already found to be sitting on a question (see probe_idle_questions)
     # is promoted here too, from the flag rather than by reading again. Without this a client
     # gets the raw herdr status on connect -- `done` for the very pane that is waiting on it --
@@ -2888,6 +3208,8 @@ async def send_current_snapshot(ws):
     # Force the hierarchy read: a client that just connected has no chip strip at all, and
     # waiting out the slow cadence would show it agents filed under ids for a few seconds.
     spaces = await asyncio.to_thread(refresh_spaces, force=True)
+    if gen != POLL_GENERATION:
+        return
     await ws.send(json.dumps(
         {"type": "agents", "agents": agents, "spaces": spaces, "panes": shells,
          **upload_advert()}))
@@ -2895,6 +3217,8 @@ async def send_current_snapshot(ws):
         if agent["status"] != "blocked":
             continue
         content = await asyncio.to_thread(read_pane, agent["pane_id"], remote=agent.get("remote"))
+        if gen != POLL_GENERATION:
+            return
         await ws.send(json.dumps(blocked_message(
             agent["pane_id"],
             agent["agent"],
@@ -2963,24 +3287,31 @@ def probe_idle_questions(agents):
 
 async def _poll_once():
         global _upload_expired_at, _upload_spool_cleared
+        await asyncio.to_thread(refresh_sources)
         gen = POLL_GENERATION
         if UPLOADS_ENABLED and not _upload_spool_cleared:
             # Before get_all_panes, while known_panes is still empty and no upload can start.
             _upload_spool_cleared = True
             await asyncio.to_thread(clear_upload_spool)
         agents, shells = await asyncio.to_thread(get_all_panes)
+        if gen != POLL_GENERATION:
+            return
         # Before update_pane_maps and before the snapshot, so the activity ledger, the clients and
         # the blocked branch below all see one status for the pane rather than three.
         probed = await asyncio.to_thread(probe_idle_questions, agents)
         for a in agents:
             if (a.get("host", "local"), a["pane_id"]) in probed:
                 a["status"] = "blocked"
+        if gen != POLL_GENERATION:
+            return
         update_pane_maps(agents, shells)
         # Always broadcast (even empty list) so clients stay in sync
         spaces = await asyncio.to_thread(refresh_spaces)
+        if gen != POLL_GENERATION:
+            return
         await broadcast(
             {"type": "agents", "agents": agents, "spaces": spaces, "panes": shells,
-             **upload_advert()})
+             "source_status": dict(source_status), **upload_advert()})
         if gen != POLL_GENERATION:
             return          # a switch landed; this snapshot is stale
         for a in agents:
@@ -2991,6 +3322,8 @@ async def _poll_once():
                 content = probed.get((a.get("host", "local"), pid))
                 if content is None:
                     content = await asyncio.to_thread(read_pane, pid, remote=a.get("remote"))
+                if gen != POLL_GENERATION:
+                    return
                 message = blocked_message(
                     pid,
                     a["agent"],
@@ -3067,6 +3400,12 @@ async def event_push():
             continue
         gen = POLL_GENERATION
         pane_id = event.get("pane_id", "")
+        event_host = event.get("host", "local")
+        # Plugins carry native pane IDs with no authenticated source/session binding. Remote
+        # events are refresh hints only; a local plugin cannot name a namespaced remote pane.
+        if event.get("remote") or event_host not in (None, "", "local", socket.gethostname()) or pane_id in source_bindings:
+            mark_spaces_dirty()
+            continue
         update = None
         if pane_id and event.get("type") == "agent_event":
             update = complete_agent_update_message(
@@ -3095,6 +3434,8 @@ async def event_push():
                     "host": host,
                     "remote": event_remote,
                 })
+            if gen != POLL_GENERATION:
+                continue
             update_pane_maps(agents, shells)
             await broadcast({"type": "agents", "agents": agents, "panes": shells})
             if gen != POLL_GENERATION:
@@ -3529,6 +3870,11 @@ async def start_upload(ws, slot, msg):
         await refuse_upload(ws, slot, upload_id, error)
         return
     try:
+        binding = upload_binding(msg["pane_id"])
+    except ValueError:
+        await refuse_upload(ws, slot, upload_id, "upload source/session changed")
+        return
+    try:
         spool = await asyncio.to_thread(create_upload_spool)
     except OSError as exc:
         log.warning("Upload %s: could not create a spool file: %s", upload_id, exc)
@@ -3537,7 +3883,7 @@ async def start_upload(ws, slot, msg):
     upload = {
         "id": upload_id, "pane_id": msg["pane_id"], "name": msg.get("name"),
         "size": msg["size"], "received": 0, "seq": 0, "spool": spool,
-        "timer": None, "armed": 0,
+        "timer": None, "armed": 0, "binding": binding,
     }
     slot["upload"] = upload
     arm_upload_timer(ws, slot, upload)
@@ -3610,7 +3956,10 @@ async def finish_upload(ws, slot, msg, ip, device):
         # Queued rather than refused: the client has already sent the bytes, and the wait is the
         # one ahead of it finishing. The idle timer is paused above, so waiting cannot drop it.
         async with _upload_store_slots:
-            path = await asyncio.to_thread(store_upload, upload["spool"], pane_id, upload["name"])
+            if upload.get("binding") is not None and upload_binding(pane_id) != upload["binding"]:
+                raise ValueError("upload source/session changed")
+            path = await asyncio.to_thread(store_upload, upload["spool"], pane_id, upload["name"],
+                                           upload.get("binding"))
     except (OSError, ValueError, subprocess.SubprocessError) as exc:
         log.warning("Upload %s for pane %s failed: %s", upload_id, pane_id, exc)
         await refuse_upload(ws, slot, upload_id, "could not store the file")
@@ -3945,16 +4294,23 @@ async def handle_client(ws):
                     await ws.send(json.dumps(commands_error("unknown pane_id")))
                     continue
                 pane = agent_cache.get(pane_id) or {}
+                request_generation = POLL_GENERATION
+                files_remote, files_runner = source_file_transport(pane_remote_map.get(pane_id))
                 try:
                     body = await asyncio.to_thread(
                         command_catalog.commands,
                         pane_session_map.get(pane_id),
-                        remote=pane_remote_map.get(pane_id),
+                        remote=files_remote,
                         agent=pane.get("agent", ""),
+                        ssh_runner=files_runner,
+                        ssh_args=SSH_BASE_ARGS,
                     )
                 except Exception:
                     # Neither filesystem paths nor exception details belong in logs or replies.
                     await ws.send(json.dumps(commands_error("Could not read runtime commands")))
+                    continue
+                if request_generation != POLL_GENERATION or pane_id not in known_panes:
+                    await ws.send(json.dumps(commands_error("source changed; refresh required")))
                     continue
                 await ws.send(json.dumps({"type": "commands", **commands_scope, **body}))
             elif msg_type == "get_history":
@@ -4001,22 +4357,27 @@ async def handle_client(ws):
                 # Off the event loop: a cold read of the biggest transcript on this machine (33MB)
                 # measured 0.29s, and a remote one is an SSH round trip. Neighbouring handlers
                 # block the loop on their subprocess; this one is too slow to join them.
+                request_generation = POLL_GENERATION
+                files_remote, files_runner = source_file_transport(remote)
                 try:
                     body = await asyncio.to_thread(
                         transcript.history,
                         pane_session_map.get(pane_id),
-                        remote=remote,
+                        remote=files_remote,
                         limit=limit,
                         before=before or None,
                         include_tools=bool(msg.get("include_tools")),
                         agent=pane.get("agent", ""),
                         ssh_args=SSH_BASE_ARGS,
-                        remote_runner=transcript_ssh,
+                        remote_runner=files_runner,
                         log=log,
                     )
                 except Exception:
                     log.exception("transcript read failed for %s", pane_id)
                     await ws.send(json.dumps(history_error("Could not read the transcript")))
+                    continue
+                if request_generation != POLL_GENERATION or pane_id not in known_panes:
+                    await ws.send(json.dumps(history_error("source changed; refresh required")))
                     continue
                 await ws.send(json.dumps({"type": "history", **history_scope, **body}))
             elif msg_type == "send_keys":
